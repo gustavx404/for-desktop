@@ -74,6 +74,11 @@ these issues and testing the fixes live with me — obrigado por ajudar a
 deixar isso melhor para todo mundo que usa em português! 🇧🇷
 — Gustavo ([@gustavx404](https://github.com/gustavx404))
 
+Thank you so much to everyone who built this app. It's really great, and
+it's a pleasure to be able to help and contribute to making it even
+better! ❤️
+— Gustavo ([@gustavx404](https://github.com/gustavx404))
+
 ## Installation
 
 <a href="https://repology.org/project/stoat-desktop/versions">
