@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld("native", {
   maximise: () => ipcRenderer.send("maximise"),
   close: () => ipcRenderer.send("close"),
 
+  selectServer: (url: string) => ipcRenderer.send("selectServer", url),
+
   setBadgeCount: (count: number) => ipcRenderer.send("setBadgeCount", count),
 
   onceScreenPicker: (
@@ -32,6 +34,12 @@ contextBridge.exposeInMainWorld("native", {
   },
   screenPickerCallback: (idx: number, audio: boolean) =>
     ipcRenderer.send("screenPickerCallback", idx, audio),
+
+  audioSharePickerCallback: (
+    mode: { type: "app"; appName: string } | { type: "all" } | { type: "none" },
+  ) => ipcRenderer.send("audioSharePickerCallback", mode),
+
+  screenShareEnded: () => ipcRenderer.send("screenShareEnded"),
 
   isWayland: () => ipcRenderer.invoke("getIsWayland"),
 });

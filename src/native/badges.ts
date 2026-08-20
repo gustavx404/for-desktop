@@ -2,6 +2,7 @@ import dbus from "@homebridge/dbus-native";
 
 import { NativeImage, app, ipcMain, nativeImage } from "electron";
 
+import { getStrings } from "./i18n";
 import { mainWindow } from "./window";
 
 // internal state
@@ -9,27 +10,36 @@ const nativeIcons: Record<number, NativeImage> = {};
 let sessionBus: dbus.MessageBus | null;
 
 export async function setBadgeCount(count: number) {
+  const t = getStrings().accessibility;
+
   switch (process.platform) {
     case "win32":
-    case "linux":
+    case "linux": {
       if (count === 0) {
-        mainWindow.setOverlayIcon(null, "No Notifications");
+        mainWindow.setOverlayIcon(null, t.noNotifications);
         break;
       }
 
-      if (!nativeIcons[count])
-        nativeIcons[count] = nativeImage.createFromDataURL(
-          await import(
-            `../../assets/desktop/badges/${Math.min(count, 10)}.ico?asset`
-          ).then((asset) => asset.default),
+      // Cache key must match the asset actually loaded (clamped to 10),
+      // not the raw count -- keying by count would grow this cache
+      // without bound as unread counts climb over a long session (each
+      // distinct count above 10 would cache its own redundant copy of
+      // the exact same "10.ico" bitmap instead of reusing one).
+      const iconKey = Math.min(count, 10);
+      if (!nativeIcons[iconKey])
+        nativeIcons[iconKey] = nativeImage.createFromDataURL(
+          await import(`../../assets/desktop/badges/${iconKey}.ico?asset`).then(
+            (asset) => asset.default,
+          ),
         );
 
       mainWindow.setOverlayIcon(
-        nativeIcons[count],
-        count === -1 ? `Unread Messages` : `${count} Notifications`,
+        nativeIcons[iconKey],
+        count === -1 ? t.unreadMessages : t.notificationsCount(count),
       );
 
       break;
+    }
     // @ts-expect-error this is `linux` block
     case "_": // todo: try to get this to work
       // send D-Bus message

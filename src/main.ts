@@ -5,9 +5,14 @@ import started from "electron-squirrel-startup";
 
 import { config } from "./native/config";
 import { initDiscordRpc } from "./native/discordRpc";
+import { getStrings } from "./native/i18n";
 import { initTray } from "./native/tray";
 import { initVirtualMic } from "./native/virtualMic";
-import { BUILD_URL, createMainWindow, mainWindow } from "./native/window";
+import {
+  createMainWindow,
+  isNavigationAllowed,
+  mainWindow,
+} from "./native/window";
 
 // Squirrel-specific logic
 // create/remove shortcuts on Windows when installing / uninstalling
@@ -25,9 +30,11 @@ if (!config.hardwareAcceleration) {
 const acquiredLock = app.requestSingleInstanceLock();
 
 const onNotifyUser = (_info: IUpdateInfo) => {
+  const t = getStrings().notifications;
+
   const notification = new Notification({
-    title: "Update Available",
-    body: "Restart the app to install the update.",
+    title: t.updateAvailableTitle,
+    body: t.updateAvailableBody,
     silent: true,
   });
 
@@ -89,7 +96,7 @@ if (acquiredLock) {
   app.on("web-contents-created", (_, contents) => {
     // prevent navigation out of build URL origin
     contents.on("will-navigate", (event, navigationUrl) => {
-      if (new URL(navigationUrl).origin !== BUILD_URL.origin) {
+      if (!isNavigationAllowed(navigationUrl)) {
         event.preventDefault();
       }
     });

@@ -28,6 +28,12 @@ const schema = {
   discordRpc: {
     type: "boolean",
   } as JSONSchema.Boolean,
+  serverUrl: {
+    type: "string",
+  } as JSONSchema.String,
+  favoriteServerUrl: {
+    type: "string",
+  } as JSONSchema.String,
   windowState: {
     type: "object",
     properties: {
@@ -60,6 +66,8 @@ const store = new Store({
     spellchecker: true,
     hardwareAcceleration: true,
     discordRpc: true,
+    serverUrl: "",
+    favoriteServerUrl: "",
     windowState: {
       x: 0,
       y: 0,
@@ -83,6 +91,8 @@ class Config {
       spellchecker: this.spellchecker,
       hardwareAcceleration: this.hardwareAcceleration,
       discordRpc: this.discordRpc,
+      serverUrl: this.serverUrl,
+      favoriteServerUrl: this.favoriteServerUrl,
       windowState: this.windowState,
     });
   }
@@ -186,6 +196,34 @@ class Config {
 
     (store as never as { set(k: string, value: boolean): void }).set(
       "discordRpc",
+      value,
+    );
+
+    this.sync();
+  }
+
+  get serverUrl() {
+    return (store as never as { get(k: string): string }).get("serverUrl");
+  }
+
+  set serverUrl(value: string) {
+    (store as never as { set(k: string, value: string): void }).set(
+      "serverUrl",
+      value,
+    );
+
+    this.sync();
+  }
+
+  get favoriteServerUrl() {
+    return (store as never as { get(k: string): string }).get(
+      "favoriteServerUrl",
+    );
+  }
+
+  set favoriteServerUrl(value: string) {
+    (store as never as { set(k: string, value: string): void }).set(
+      "favoriteServerUrl",
       value,
     );
 

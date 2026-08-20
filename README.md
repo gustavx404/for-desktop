@@ -13,6 +13,72 @@ Application for Windows, macOS, and Linux.
 </div>
 <br/>
 
+## Recent Improvements (Linux/Wayland)
+
+This fork includes a round of fixes and optimizations for screen-share audio
+on Linux/Wayland, self-hosted server connectivity, and general memory and
+performance work across the app:
+
+**Self-hosted server connection**
+
+- Added a landing screen (shown on first launch, or whenever no server is
+  configured) to connect to either the official server or a self-hosted
+  one, with the self-hosted choice remembered as a "favourite" for one
+  click access later.
+- Fixed a bug where a self-hosted server would sometimes load but never
+  finish mounting its UI, leaving a blank window with no way to retry;
+  this is now detected automatically, retried a few times, and falls
+  back to the landing screen with a clear notice if it still doesn't load.
+- Added a tray menu entry to switch between the official server, the
+  saved self-hosted favourite, and to open the landing screen to connect
+  to a different server entirely.
+
+**Screen-share audio**
+
+- Fixed screen-share audio not being sent at all on Wayland (Electron's
+  `audio: "loopback"` never worked outside Windows).
+- Fixed other apps' audio leaking into a share that was supposed to carry
+  only one chosen app's audio, and a resulting feedback/echo of the user's
+  own voice.
+- Fixed audio silently and permanently dropping out after the first working
+  share, caused by a race condition in the PipeWire linking logic.
+- Added automatic self-healing for PipeWire links that drop intermittently
+  (a platform-level flakiness, not something the app can prevent outright),
+  so audio recovers within about a second instead of staying broken.
+- Replaced adaptive auto-gain control (which made the shared volume drift
+  up and down on its own) with a fixed, predictable gain boost.
+- Redesigned the "which app's audio to share" picker as an in-app panel
+  that follows the app's actual live theme (color, typography, corner
+  radius), instead of a generic OS context menu.
+
+**Performance & memory**
+
+- The PipeWire polling loop now fully stops when no screen share is active,
+  instead of running unconditionally in the background for the app's
+  entire lifetime.
+- Fixed several memory leaks: unbounded native icon cache, a Discord RPC
+  client whose transport was never closed on reconnect, disconnected but
+  still-tracked Web Audio graph nodes, and IPC listeners that could
+  outlive the windows/dialogs that registered them.
+- Added scheme validation on the server-switching IPC channel to prevent a
+  compromised or malicious self-hosted server from navigating the app
+  window to a local file.
+
+> These fixes were implemented with the help of AI (Claude, by Anthropic),
+> pairing live debugging against a running instance with source-level
+> review, to track down and fix issues that don't reproduce reliably by
+> reading code alone.
+
+I want to thank the Brazilian Stoat/self-hosted community for surfacing
+these issues and testing the fixes live with me — obrigado por ajudar a
+deixar isso melhor para todo mundo que usa em português! 🇧🇷
+— Gustavo ([@gustavx404](https://github.com/gustavx404))
+
+Thank you so much to everyone who built this app. It's really great, and
+it's a pleasure to be able to help and contribute to making it even
+better! ❤️
+— Gustavo ([@gustavx404](https://github.com/gustavx404))
+
 ## Installation
 
 <a href="https://repology.org/project/stoat-desktop/versions">

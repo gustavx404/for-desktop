@@ -22,7 +22,18 @@ jobs:
       release_created: ${{ steps.rp.outputs.release_created }}
       release_version: ${{ steps.rp.outputs.version }}
     steps:
+      # Uses a dedicated GitHub App on the upstream repo (its release PRs
+      # need to trigger other workflows, which pushes authenticated with
+      # the default GITHUB_TOKEN can't do -- GitHub deliberately doesn't
+      # let a workflow run using that token kick off further workflow
+      # runs, to avoid accidental recursion). On a fork without that
+      # app's secrets configured, skip straight to falling back to
+      # GITHUB_TOKEN below instead of failing outright: release-please
+      # still runs and this workflow's own downstream jobs (which don't
+      # rely on a separate trigger, just this run's own job graph) still
+      # execute normally either way.
       - id: app-token
+        if: ${{ secrets.GH_STOAT_RELEASE_APP_ID != '' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.GH_STOAT_RELEASE_APP_ID }}
@@ -30,7 +41,7 @@ jobs:
       - id: rp
         uses: googleapis/release-please-action@v4
         with:
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
 
   publish-release:
