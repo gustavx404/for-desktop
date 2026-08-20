@@ -17,9 +17,23 @@ import { sourceName } from "../constants";
  * in here wouldn't affect what the actual web app calls. `executeJavaScript`
  * is the one Electron API that reaches into the main world.
  */
+// Same platform check virtualMic.ts uses on the main-process side --
+// duplicated here (rather than imported) because that module also pulls
+// in "electron"'s ipcMain/app, which only exist in the main process and
+// would throw if evaluated from this preload/renderer-world file.
+const isWayland =
+  process.platform === "linux" &&
+  (process.env.XDG_SESSION_TYPE === "wayland" || !!process.env.WAYLAND_DISPLAY);
+
 const patchScript = /* js */ `
 (() => {
   const SOURCE_NAME = ${JSON.stringify(sourceName)};
+  // Only Wayland's portal/PipeWire capture path is known to leak native
+  // buffers across repeated getDisplayMedia() negotiations -- Windows
+  // and macOS use an entirely different, non-portal capture backend
+  // that isn't affected, so the video-reuse path below only activates
+  // here rather than changing behaviour anywhere it isn't needed.
+  const IS_WAYLAND = ${JSON.stringify(isWayland)};
   const md = navigator.mediaDevices;
   if (!md || md.__stoatAudioPatched) return;
   md.__stoatAudioPatched = true;
@@ -93,15 +107,49 @@ const patchScript = /* js */ `
   // polling PipeWire for a share that no longer exists.
   const liveRounds = new Set();
 
+  // The one genuinely negotiated video track for the share currently in
+  // progress (as opposed to a clone handed out for a later round -- see
+  // getDisplayMedia below). Kept around so the "all rounds ended" path
+  // can positively stop it even if the web app itself only ever stopped
+  // clones it was handed, never this original.
+  let realVideoTrack = null;
+
   function trackShareRound(stream) {
     const videoTrack = stream.getVideoTracks()[0];
     if (!videoTrack) return;
+
+    // The provisional round's track is never stopped by anyone: the web
+    // app just drops its reference once the confirmed round replaces
+    // it, and MediaStreamTrack.stop() is never automatic -- a track
+    // nobody calls .stop() on keeps its native capture (the actual
+    // screen-grab session, with all the GPU/shared-memory frame buffers
+    // backing it) running indefinitely, invisible to JS heap stats
+    // since none of that lives on the V8 heap. Left alone this
+    // compounds on every single share (each one abandons its own
+    // provisional round the same way), which is exactly what showed up
+    // as memory that kept climbing further with every share and never
+    // came back down. Explicitly stopping any round still marked live
+    // the moment a fresh one starts -- rather than waiting on an
+    // "ended" event that this specific track will never fire --closes
+    // that gap without depending on the web app's own cleanup.
+    for (const oldTrack of liveRounds) {
+      if (oldTrack !== videoTrack) oldTrack.stop();
+    }
+    liveRounds.clear();
+
     liveRounds.add(videoTrack);
     videoTrack.addEventListener(
       "ended",
       () => {
         liveRounds.delete(videoTrack);
         if (liveRounds.size > 0) return;
+        // Belt-and-braces: whatever the app actually stopped (the
+        // original or a clone of it), make sure the real underlying
+        // capture is stopped too rather than assuming it already was.
+        if (realVideoTrack) {
+          realVideoTrack.stop();
+          realVideoTrack = null;
+        }
         stopActiveCapture();
         window.native.screenShareEnded();
       },
@@ -110,7 +158,28 @@ const patchScript = /* js */ `
   }
 
   md.getDisplayMedia = async function (constraints) {
-    const stream = await originalGetDisplayMedia(constraints);
+    let stream;
+
+    if (IS_WAYLAND && realVideoTrack && realVideoTrack.readyState === "live") {
+      // A later round of the share still in progress -- most commonly
+      // the web app's own provisional -> confirmed handoff. Handing
+      // back a *clone* of the still-running capture, instead of asking
+      // Chromium to negotiate a brand new portal/PipeWire session,
+      // avoids the leak above at its source rather than just cleaning
+      // up after it: a clone shares the same underlying capture but has
+      // its own independent stop(), so the app is free to stop() what
+      // it thinks is the stale round without affecting this one -- and
+      // no second negotiation ever happens for it to leak from. This
+      // can only trigger while a share is still actively in progress
+      // (realVideoTrack is cleared the moment every round has ended, in
+      // the "ended" handler above), so a genuinely new, later share
+      // always still gets its own fresh, real negotiation.
+      stream = new MediaStream([realVideoTrack.clone()]);
+    } else {
+      stream = await originalGetDisplayMedia(constraints);
+      realVideoTrack = stream.getVideoTracks()[0] || null;
+    }
+
     trackShareRound(stream);
 
     if (!constraints || !constraints.audio) return stream;
