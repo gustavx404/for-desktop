@@ -198,7 +198,12 @@ const config: ForgeConfig = {
   publishers: [
     new PublisherGithub({
       repository: {
-        owner: "stoatchat",
+        // Read from the CI-provided "owner/repo" env var rather than a
+        // fixed owner, so a fork's own release workflow publishes to
+        // that fork (using its own GITHUB_TOKEN, which only has write
+        // access there) instead of failing against -- or, worse if it
+        // ever did have access, actually publishing to -- upstream.
+        owner: process.env.GITHUB_REPOSITORY?.split("/")[0] ?? "stoatchat",
         name: "for-desktop",
       },
     }),
