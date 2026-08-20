@@ -69,9 +69,10 @@ performance work across the app:
 > review, to track down and fix issues that don't reproduce reliably by
 > reading code alone.
 
-Thanks to the Brazilian Stoat/self-hosted community for surfacing these
-issues and testing the fixes live — obrigado por ajudar a deixar isso
-melhor para todo mundo que usa em português! 🇧🇷
+I want to thank the Brazilian Stoat/self-hosted community for surfacing
+these issues and testing the fixes live with me — obrigado por ajudar a
+deixar isso melhor para todo mundo que usa em português! 🇧🇷
+— Gustavo ([@gustavx404](https://github.com/gustavx404))
 
 ## Installation
 
