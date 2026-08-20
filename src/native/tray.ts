@@ -4,7 +4,17 @@ import trayIconAsset from "../../assets/desktop/icon.png?asset";
 import macOsTrayIconAsset from "../../assets/desktop/iconTemplate.png?asset";
 import { version } from "../../package.json";
 
-import { mainWindow, quitApp } from "./window";
+import { getStrings } from "./i18n";
+import {
+  changeServer,
+  getCurrentServerUrl,
+  getFavoriteServerUrl,
+  isDefaultServerUrl,
+  mainWindow,
+  quitApp,
+  useFavoriteServer,
+  useOfficialServer,
+} from "./window";
 
 // internal tray state
 let tray: Tray = null;
@@ -38,11 +48,28 @@ export function initTray() {
 }
 
 export function updateTrayMenu() {
+  // tray may not exist yet the first time the window loads a server
+  if (!tray) {
+    return;
+  }
+
+  const currentServerUrl = getCurrentServerUrl();
+  const isOnDefaultServer =
+    currentServerUrl !== null && isDefaultServerUrl(currentServerUrl);
+
+  const favoriteServerUrl = getFavoriteServerUrl();
+  const isOnFavoriteServer =
+    favoriteServerUrl !== null &&
+    currentServerUrl !== null &&
+    new URL(currentServerUrl).origin === new URL(favoriteServerUrl).origin;
+
+  const t = getStrings().tray;
+
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: "Stoat for Desktop", type: "normal", enabled: false },
       {
-        label: "Version",
+        label: t.version,
         type: "submenu",
         submenu: Menu.buildFromTemplate([
           {
@@ -54,7 +81,48 @@ export function updateTrayMenu() {
       },
       { type: "separator" },
       {
-        label: mainWindow.isVisible() ? "Hide App" : "Show App",
+        label: t.server,
+        type: "submenu",
+        submenu: Menu.buildFromTemplate([
+          {
+            label: t.officialServer,
+            type: "radio",
+            checked: isOnDefaultServer,
+            click: useOfficialServer,
+          },
+          ...(favoriteServerUrl
+            ? [
+                {
+                  label: new URL(favoriteServerUrl).host,
+                  type: "radio" as const,
+                  checked: isOnFavoriteServer,
+                  click: useFavoriteServer,
+                },
+              ]
+            : []),
+          // current server matches neither preset above (e.g. a one-off
+          // --force-server) -- call it out so the radio group isn't
+          // misleading
+          ...(currentServerUrl && !isOnDefaultServer && !isOnFavoriteServer
+            ? [
+                {
+                  label: t.other(new URL(currentServerUrl).host),
+                  type: "normal" as const,
+                  enabled: false,
+                },
+              ]
+            : []),
+          { type: "separator" },
+          {
+            label: t.changeServer,
+            type: "normal",
+            click: changeServer,
+          },
+        ]),
+      },
+      { type: "separator" },
+      {
+        label: mainWindow.isVisible() ? t.hideApp : t.showApp,
         type: "normal",
         click() {
           if (mainWindow.isVisible()) {
@@ -65,7 +133,7 @@ export function updateTrayMenu() {
         },
       },
       {
-        label: "Quit App",
+        label: t.quitApp,
         type: "normal",
         click: quitApp,
       },

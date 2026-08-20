@@ -13,6 +13,51 @@ Application for Windows, macOS, and Linux.
 </div>
 <br/>
 
+## Recent Improvements (Linux/Wayland)
+
+This fork includes a round of fixes and optimizations for screen-share audio
+on Linux/Wayland, plus general memory and performance work across the app:
+
+**Screen-share audio**
+
+- Fixed screen-share audio not being sent at all on Wayland (Electron's
+  `audio: "loopback"` never worked outside Windows).
+- Fixed other apps' audio leaking into a share that was supposed to carry
+  only one chosen app's audio, and a resulting feedback/echo of the user's
+  own voice.
+- Fixed audio silently and permanently dropping out after the first working
+  share, caused by a race condition in the PipeWire linking logic.
+- Added automatic self-healing for PipeWire links that drop intermittently
+  (a platform-level flakiness, not something the app can prevent outright),
+  so audio recovers within about a second instead of staying broken.
+- Replaced adaptive auto-gain control (which made the shared volume drift
+  up and down on its own) with a fixed, predictable gain boost.
+- Redesigned the "which app's audio to share" picker as an in-app panel
+  that follows the app's actual live theme (color, typography, corner
+  radius), instead of a generic OS context menu.
+
+**Performance & memory**
+
+- The PipeWire polling loop now fully stops when no screen share is active,
+  instead of running unconditionally in the background for the app's
+  entire lifetime.
+- Fixed several memory leaks: unbounded native icon cache, a Discord RPC
+  client whose transport was never closed on reconnect, disconnected but
+  still-tracked Web Audio graph nodes, and IPC listeners that could
+  outlive the windows/dialogs that registered them.
+- Added scheme validation on the server-switching IPC channel to prevent a
+  compromised or malicious self-hosted server from navigating the app
+  window to a local file.
+
+> These fixes were implemented with the help of AI (Claude, by Anthropic),
+> pairing live debugging against a running instance with source-level
+> review, to track down and fix issues that don't reproduce reliably by
+> reading code alone.
+
+Thanks to the Brazilian Stoat/self-hosted community for surfacing these
+issues and testing the fixes live — obrigado por ajudar a deixar isso
+melhor para todo mundo que usa em português! 🇧🇷
+
 ## Installation
 
 <a href="https://repology.org/project/stoat-desktop/versions">
