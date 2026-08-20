@@ -16,7 +16,22 @@ Application for Windows, macOS, and Linux.
 ## Recent Improvements (Linux/Wayland)
 
 This fork includes a round of fixes and optimizations for screen-share audio
-on Linux/Wayland, plus general memory and performance work across the app:
+on Linux/Wayland, self-hosted server connectivity, and general memory and
+performance work across the app:
+
+**Self-hosted server connection**
+
+- Added a landing screen (shown on first launch, or whenever no server is
+  configured) to connect to either the official server or a self-hosted
+  one, with the self-hosted choice remembered as a "favourite" for one
+  click access later.
+- Fixed a bug where a self-hosted server would sometimes load but never
+  finish mounting its UI, leaving a blank window with no way to retry;
+  this is now detected automatically, retried a few times, and falls
+  back to the landing screen with a clear notice if it still doesn't load.
+- Added a tray menu entry to switch between the official server, the
+  saved self-hosted favourite, and to open the landing screen to connect
+  to a different server entirely.
 
 **Screen-share audio**
 
