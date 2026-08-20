@@ -21,6 +21,12 @@ jobs:
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
       release_version: ${{ steps.rp.outputs.version }}
+    env:
+      # `secrets` can't be referenced directly in a step's `if:` (GitHub
+      # Actions rejects the whole workflow file at parse time with
+      # "Unrecognized named-value: 'secrets'") -- route the check through
+      # a job-level env var instead, which `if:` *can* read via `env.*`.
+      HAS_RELEASE_APP: ${{ secrets.GH_STOAT_RELEASE_APP_ID != '' }}
     steps:
       # Uses a dedicated GitHub App on the upstream repo (its release PRs
       # need to trigger other workflows, which pushes authenticated with
@@ -33,7 +39,7 @@ jobs:
       # rely on a separate trigger, just this run's own job graph) still
       # execute normally either way.
       - id: app-token
-        if: ${{ secrets.GH_STOAT_RELEASE_APP_ID != '' }}
+        if: ${{ env.HAS_RELEASE_APP == 'true' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.GH_STOAT_RELEASE_APP_ID }}
