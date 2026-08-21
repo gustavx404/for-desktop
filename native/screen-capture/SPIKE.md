@@ -162,6 +162,35 @@ bandwidth estimation fully converges, rather than stopping the observation
 mid-ramp; NVIDIA (CachyOS) and Intel (Pop!_OS) validation, still pending
 since the seventh session.
 
+**Live-validated with a real production call (3 real participants, not a
+LAN/loopback test), same day**: the "ultra" tier hit its full 8Mbps budget
+exactly, 2560x1440, `qualityLimitationReason: "none"`, hardware encode
+confirmed active -- the fixes above hold up under real conditions, not just
+synthetic single-machine tests. fps stayed lower (~27-29) than the earlier
+single-machine test's ~40, plausibly because this renderer was
+simultaneously decoding two incoming video streams from the other
+participants, not just encoding its own -- not yet isolated as the
+confirmed cause.
+
+**One more real bug found via this live test, fixed same day**: switching
+quality *after* a share is already in progress (the normal, common path --
+`state.tsx`'s post-share "screen_share_settings" modal, gated on
+`screenShareQualityAsk`) calls `mediaStreamTrack.applyConstraints()` to
+change what the Rust capture/source actually produces, but never touched
+the already-negotiated `RTCRtpSender`'s own bitrate/framerate parameters.
+Confirmed live: after switching from "ultra" (8Mbps budget) to "high"
+(should be capped at 5Mbps, `ScreenSharePresets.h1080fps30`'s own default),
+real `getStats()` showed the resolution correctly changed to 1920x1080 but
+`targetBitrate` stayed pinned at exactly `8000000` -- the new tier's own
+budget was never applied, only whatever the *original* `setScreenShareEnabled()`
+call happened to negotiate. Fixed in the modal's `callback` by calling the
+standard (not LiveKit-specific) `RTCRtpSender.setParameters()` -- get the
+current params, set `encodings[0].maxBitrate`/`maxFramerate` to the newly
+selected tier's `encoding`, `setParameters()` back -- right alongside the
+existing `applyConstraints()` call. Not yet re-validated live (deployed,
+not yet tested) -- do that before trusting it the way every other fix in
+this file was live-confirmed.
+
 ## Session update (2026-08-21, seventh session): AMD hardware H264/HEVC
 ## encode CONFIRMED working after fixing the missing VA-API driver -- the
 ## CPU bottleneck found in the sixth session has a real hardware fix on
