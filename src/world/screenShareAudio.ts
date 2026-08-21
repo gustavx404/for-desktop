@@ -333,6 +333,33 @@ function buildPatchScript(isWayland: boolean) {
   let currentWriter = null;
   let writeBusy = false;
   let loggedUnsupportedFormat = false;
+  // Temporary diagnostic (2026-08-21): real WebRTC stats showed the
+  // encoder receiving far fewer frames than this addon actually sends
+  // (e.g. ~40fps sent by the Rust addon, ~15fps encoded) -- these
+  // counters (received: every framePort message; droppedWriteBusy: an
+  // in-flight write() blocking the next frame; droppedDesiredSize: the
+  // writable stream's own backpressure; written: currentWriter.write()
+  // actually called), logged every 2s, answer whether the loss is this
+  // patch's own writeBusy/backpressure gating or something downstream of
+  // it (VideoFrame construction cost, or Chromium's own internal
+  // encode/send queue). Remove once that's answered.
+  let diagReceived = 0;
+  let diagDroppedWriteBusy = 0;
+  let diagDroppedDesiredSize = 0;
+  let diagWritten = 0;
+  setInterval(() => {
+    if (diagReceived === 0) return;
+    console.log("[stoat-frame-diag]", {
+      received: diagReceived,
+      droppedWriteBusy: diagDroppedWriteBusy,
+      droppedDesiredSize: diagDroppedDesiredSize,
+      written: diagWritten,
+    });
+    diagReceived = 0;
+    diagDroppedWriteBusy = 0;
+    diagDroppedDesiredSize = 0;
+    diagWritten = 0;
+  }, 2000);
   // Used to give each VideoFrame a real duration (below) instead of
   // leaving it unset -- LiveKit/WebRTC's own frame-rate detection and
   // pacing use it, same as any other video source's actual frame timing
@@ -343,6 +370,7 @@ function buildPatchScript(isWayland: boolean) {
   framePortReady.then(() => {
     framePort.onmessage = (event) => {
       const frame = event.data;
+      diagReceived++;
       if (!currentWriter) return;
       // NOTE: deliberately NOT treating realVideoTrack.enabled === false as
       // "this round ended" (an earlier version of this check did, and it
@@ -372,7 +400,10 @@ function buildPatchScript(isWayland: boolean) {
         }
         return;
       }
-      if (writeBusy) return;
+      if (writeBusy) {
+        diagDroppedWriteBusy++;
+        return;
+      }
       // currentWriter.write()'s returned promise resolves as soon as the
       // frame is handed to Chromium's own internal media pipeline, NOT
       // when it's actually been encoded and sent -- confirmed live: with
@@ -389,7 +420,11 @@ function buildPatchScript(isWayland: boolean) {
       // last write()'s promise has resolved yet. Skipping the frame
       // here (same as the writeBusy/pixelFormat drops above) means it's
       // simply never constructed -- nothing to leak.
-      if ((currentWriter.desiredSize ?? 1) <= 0) return;
+      if ((currentWriter.desiredSize ?? 1) <= 0) {
+        diagDroppedDesiredSize++;
+        return;
+      }
+      diagWritten++;
       writeBusy = true;
       const timestamp = Math.round(performance.now() * 1000);
       const vf = new VideoFrame(frame.data, {
@@ -460,15 +495,29 @@ function buildPatchScript(isWayland: boolean) {
   // comment above for why a plain .clone() doesn't work for reuse here).
   function createRustVideoTrack() {
     const generator = new MediaStreamTrackGenerator({ kind: "video" });
-    // Without this, the WebRTC encoder has no signal that this is screen
-    // content (sharp text/UI, mostly static) rather than a camera feed
-    // (motion-heavy, blur-tolerant) -- it defaults to encoding settings
-    // tuned for the latter, which is exactly what reads as "low bitrate,
-    // blurry/blocky" on the viewing end even though nothing about the
-    // capture itself changed. Chromium's own desktopCapturer-backed
-    // tracks get this hint automatically; a MediaStreamTrackGenerator
-    // does not, so it has to be set explicitly here.
-    generator.contentHint = "text";
+    // Without any hint, the WebRTC encoder has no signal that this is
+    // screen content at all -- it defaults to encoding settings tuned
+    // for a camera feed. Chromium's own desktopCapturer-backed tracks
+    // get a hint automatically; a MediaStreamTrackGenerator does not, so
+    // it has to be set explicitly here.
+    //
+    // "motion" (prioritize frame rate), not "text" (prioritize detail --
+    // the strongest sharpness preference, most aggressive about trading
+    // frame rate away for it). Live-measured this session with "text":
+    // this addon delivering ~40fps at 1440p, zero drops on the write
+    // side (currentWriter.write() called for every frame, confirmed via
+    // counters), yet WebRTC's own outbound-rtp stats showed only ~15fps
+    // actually encoded, qualityLimitationReason "none" the whole time
+    // (i.e. not bandwidth/CPU limited -- the encoder was simply being
+    // fed fewer frames than were available, matching "text" hint's own
+    // documented trade-off). for-web's own quality picker
+    // (state.tsx's getEnabledScreenShareQualities) already settled on
+    // "motion" for every quality tier it defines -- matching that
+    // default here means a share that never opens the quality-picker
+    // modal (screenShareQualityAsk off, or no picker shown) doesn't get
+    // stuck on this addon's own more conservative initial default
+    // instead.
+    generator.contentHint = "motion";
     currentWriter = generator.writable.getWriter();
     writeBusy = false;
     lastTimestampUs = null;

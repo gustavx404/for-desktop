@@ -457,6 +457,20 @@ fn capture_loop(
     // RSS/CPU numbers before trusting it, same as any other value here.
     let min_frame_interval = std::time::Duration::from_millis(1000 / frame_rate.max(1) as u64);
     let last_frame_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+    // Temporary diagnostic (2026-08-21): live-measured real WebRTC stats
+    // showed ~4fps delivered despite a 60fps target and real on-screen
+    // motion (dragging a window), with qualityLimitationReason "none" --
+    // meaning the encoder wasn't bandwidth/CPU limited, it was starved of
+    // input frames. These two counters (dequeued: every buffer PipeWire
+    // actually handed us, sent: how many passed this interval filter and
+    // got forwarded to JS), printed periodically, answer whether
+    // PipeWire itself is the one not producing frames fast enough during
+    // real motion, or whether this addon's own filter/pipeline is
+    // dropping frames it shouldn't. Remove once that's answered.
+    let dequeued_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sent_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dequeued_count_for_process = dequeued_count.clone();
+    let sent_count_for_process = sent_count.clone();
 
     let _listener = stream
         .add_local_listener::<()>()
@@ -474,6 +488,7 @@ fn capture_loop(
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            dequeued_count_for_process.fetch_add(1, Ordering::Relaxed);
 
             let now = std::time::Instant::now();
             {
@@ -536,6 +551,7 @@ fn capture_loop(
                 format: info.format().as_raw(),
                 pixel_format: pixel_format.map(str::to_string),
             };
+            sent_count_for_process.fetch_add(1, Ordering::Relaxed);
             on_frame.call(Ok(frame), ThreadsafeFunctionCallMode::NonBlocking);
         })
         .register()?;
@@ -574,9 +590,20 @@ fn capture_loop(
     // the Node/Electron side, on a different thread) actually break the
     // loop in a bounded amount of time instead of blocking forever.
     let poll_loop = main_loop.clone();
+    let diag_tick = std::sync::atomic::AtomicU32::new(0);
     let timer = main_loop.loop_().add_timer(move |_| {
         if stop_flag.load(Ordering::SeqCst) {
             poll_loop.quit();
+        }
+        // Every ~2s (100ms timer * 20): see this fn's own doc comment
+        // above (dequeued_count/sent_count) for why this exists.
+        if diag_tick.fetch_add(1, Ordering::Relaxed) + 1 >= 20 {
+            diag_tick.store(0, Ordering::Relaxed);
+            eprintln!(
+                "[stoat-capture-diag] pipewire dequeued={} sent={} (last ~2s)",
+                dequeued_count.swap(0, Ordering::Relaxed),
+                sent_count.swap(0, Ordering::Relaxed),
+            );
         }
     });
     timer

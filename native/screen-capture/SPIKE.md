@@ -1,5 +1,93 @@
 # Rust-owned screen capture -- spike notes
 
+## Session update (2026-08-21, fifth session): bitrate/fps ceiling
+## root-caused to (likely) real network bandwidth, not code
+
+### Context: two real code bugs found and fixed in for-web (fork, not this repo)
+
+Both live in `github.com/gustavx404/Stoat-for-web`, branch
+`quality-picker-1440p60fps`, deployed on the server as a custom Docker
+build (`/srv/stoat/for-web-custom`, `compose.yml`'s `web:` service
+builds from it instead of pulling `ghcr.io/stoatchat/for-web`):
+
+1. `generator.contentHint` in this repo's `screenShareAudio.ts` was
+   hardcoded to `"text"` (the most aggressive "prioritize sharpness over
+   frame rate" hint) regardless of the quality actually selected --
+   changed to `"motion"` (already committed to this repo, see the
+   `2026-08-21, fourth session` entry above... actually see the git log,
+   this was a same-day later change). Real, but not the dominant effect
+   -- see below.
+2. `for-web`'s `state.tsx` never passed `TrackPublishOptions.videoEncoding`
+   to `setScreenShareEnabled` -- confirmed against `livekit-client`'s own
+   source that bitrate/framerate encoding targets are NOT derived from
+   the capture `resolution` automatically. Every quality tier was
+   publishing at the same generic default (~2.5Mbps) regardless of
+   whether "low" or "ultra" was selected. Fixed: each `ScreenShareQuality`
+   now carries its own `encoding: {maxBitrate, maxFramerate}`
+   (`ScreenSharePresets.h720fps30.encoding`/`h1080fps30.encoding` for
+   low/high, `{maxBitrate: 8_000_000, maxFramerate: 60}` for
+   ultra/source), passed through as `videoEncoding` alongside
+   `simulcast: false`.
+
+### Still open: real `targetBitrate` stuck at exactly 2,500,000 regardless
+
+Live-measured, repeatedly, across multiple quality tiers (1080p30,
+1440p60) and after the `videoEncoding: 8Mbps` fix was confirmed deployed
+(grepped the built bundle for `8000000`/`8e6`, present) and a 60s+ test
+(long enough to rule out GCC/congestion-control ramp-up still in
+progress): `targetBitrate` in real `RTCPeerConnection.getStats()`
+outbound-rtp reports stayed at exactly 2,500,000 every single time, with
+`qualityLimitationReason: "none"` throughout. Achieved fps scaled
+inversely with resolution at roughly that fixed byte budget (fewer,
+bigger frames fit per second at higher resolution) -- e.g. ~7-9fps
+average at both 1080p and 1440p despite 30fps/60fps targets
+respectively.
+
+**Working theory, not yet confirmed**: this is the user's real available
+upload bandwidth on their home connection (the self-hosted LiveKit
+server this session migrated onto earlier), correctly detected and
+adapted to by WebRTC's own congestion control (GCC) -- `none` doesn't
+mean "not limited by bandwidth" so much as "successfully adapted its own
+target to match what's really available," which is a real, different
+reading of that stat than earlier sessions assumed. If true, this is NOT
+fixable by any client-side code change (not `videoEncoding`, not
+`contentHint`, not migrating the whole desktop shell to Tauri/WebKitGTK
+-- ruled out explicitly this session as not the right lever for a
+network-bandwidth ceiling). **Next step, cheap, not yet done**: a real
+upload speed test (fast.com or similar) on the user's home connection.
+If it comes back near 2.5Mbps, theory confirmed, nothing left to
+optimize in this addon or its JS patches for this specific symptom. If
+it comes back much higher, the constraint is somewhere else in the path
+(most likely candidate: the TURN relay -- `livekit.yml` has
+`use_external_ip: true` and a `turn:` block configured, confirmed
+present, but whether media is actually flowing direct P2P vs
+TURN-relayed for this specific network path hasn't been checked --
+`RTCIceCandidatePair` stats, not yet pulled this session, would answer
+that directly).
+
+### Diagnostic tooling built this session (reusable for the above)
+
+- `native/screen-capture/src/lib.rs`: `dequeued`/`sent` counters in
+  `capture_loop`, printed every ~2s via `[stoat-capture-diag] pipewire
+  dequeued=X sent=Y` -- confirmed this addon delivers ~40fps cleanly at
+  both 1080p and 1440p, ruling out PipeWire/the portal and this addon's
+  own `MIN_FRAME_INTERVAL` filter as the bottleneck.
+- `src/world/screenShareAudio.ts`: `diagReceived`/`diagDroppedWriteBusy`/
+  `diagDroppedDesiredSize`/`diagWritten` counters, printed every 2s as
+  `[stoat-frame-diag]` -- confirmed zero drops on this patch's own
+  write()/backpressure gating; every received frame gets written.
+- Both are temporary and safe to remove once the bandwidth theory is
+  confirmed/refuted -- they're the reason each layer could be ruled out
+  with real numbers instead of guessing.
+- `/tmp/.../scratchpad/query-stats.mjs` (session-local, in scratchpad,
+  not committed anywhere): connects to a running Electron instance's CDP
+  port and pulls real `RTCPeerConnection.getStats()` outbound-rtp data
+  via `window.__stoatPCs` (a diagnostic global `screenShareAudio.ts`
+  already sets up). Recreate as needed: fetch `http://localhost:PORT/json/list`,
+  find the "Stoat" page target, open its `webSocketDebuggerUrl`,
+  `Runtime.evaluate` an async IIFE reading `pc.getStats()` for every
+  outbound-rtp video report.
+
 ## Session update (2026-08-21, fourth session): resolution/fps now wired
 ## end-to-end from the web app's quality picker; simulcast disabled;
 ## no hardware encode available on this GPU for any codec
