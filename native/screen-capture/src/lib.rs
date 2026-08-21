@@ -238,6 +238,7 @@ pub fn start_capture(
     eprintln!("[stoat-capture-diag] start_capture() called, spawning capture thread");
     let max_dimension = options.as_ref().and_then(|o| o.max_dimension).unwrap_or(1920);
     let frame_rate = options.as_ref().and_then(|o| o.frame_rate).unwrap_or(60);
+    eprintln!("[stoat-capture-diag] max_dimension={} frame_rate={}", max_dimension, frame_rate);
     let stop_flag = Arc::new(AtomicBool::new(false));
     let thread_stop_flag = stop_flag.clone();
 
@@ -455,7 +456,20 @@ fn capture_loop(
     // "ultra" 1440p60fps quality) are knowingly re-entering that
     // previously-froze territory -- worth a fresh live test with real
     // RSS/CPU numbers before trusting it, same as any other value here.
-    let min_frame_interval = std::time::Duration::from_millis(1000 / frame_rate.max(1) as u64);
+    // Diagnostic (2026-08-21, later): live-measured per-frame cost
+    // (copy+downscale ~2.5-3ms, the ThreadsafeFunction call itself
+    // ~0.01ms) is nowhere near this interval's own budget at 60fps
+    // (16ms) -- yet real delivery ("sent", see the diagnostic timer
+    // below) stayed around ~40fps even with dequeued confirming the
+    // compositor delivers ~70fps. Working theory: real frame delivery
+    // isn't perfectly uniform (bursts), and a strict "time since the
+    // last *accepted* frame" gate rejects burst frames even when the
+    // rolling average easily clears the target rate. A 25% margin
+    // (accepting slightly more often than the nominal interval) is a
+    // cheap way to test whether that's really it -- not yet confirmed.
+    let min_frame_interval = std::time::Duration::from_micros(
+        (1000 * 750) / frame_rate.max(1) as u64,
+    );
     let last_frame_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     // Temporary diagnostic (2026-08-21): live-measured real WebRTC stats
     // showed ~4fps delivered despite a 60fps target and real on-screen
@@ -471,6 +485,16 @@ fn capture_loop(
     let sent_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dequeued_count_for_process = dequeued_count.clone();
     let sent_count_for_process = sent_count.clone();
+    // Temporary diagnostic (2026-08-21, later): dequeued/sent alone answered
+    // "is PipeWire fast enough" (yes) but not "why does 'sent' stay around
+    // ~40fps even with min_frame_interval computed for 60fps" -- accumulated
+    // nanoseconds spent in the copy/downscale step vs the on_frame.call()
+    // step, printed alongside dequeued/sent, answers which one is actually
+    // eating the per-frame budget.
+    let copy_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let call_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let copy_ns_for_process = copy_ns.clone();
+    let call_ns_for_process = call_ns.clone();
 
     let _listener = stream
         .add_local_listener::<()>()
@@ -531,6 +555,7 @@ fn capture_loop(
             // dropped on the JS side regardless (pixel_format is None),
             // so there's no reason to risk an out-of-bounds read assuming
             // 4bpp on a format that might not be.
+            let copy_start = std::time::Instant::now();
             let (data_vec, width, height, stride) = if pixel_format.is_some() {
                 downscale_packed_4bpp(
                     bytes,
@@ -542,6 +567,7 @@ fn capture_loop(
             } else {
                 (bytes.to_vec(), info.size().width, info.size().height, src_stride)
             };
+            copy_ns_for_process.fetch_add(copy_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
             let frame = FrameData {
                 data: data_vec.into(),
@@ -552,7 +578,9 @@ fn capture_loop(
                 pixel_format: pixel_format.map(str::to_string),
             };
             sent_count_for_process.fetch_add(1, Ordering::Relaxed);
+            let call_start = std::time::Instant::now();
             on_frame.call(Ok(frame), ThreadsafeFunctionCallMode::NonBlocking);
+            call_ns_for_process.fetch_add(call_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         })
         .register()?;
 
@@ -599,10 +627,15 @@ fn capture_loop(
         // above (dequeued_count/sent_count) for why this exists.
         if diag_tick.fetch_add(1, Ordering::Relaxed) + 1 >= 20 {
             diag_tick.store(0, Ordering::Relaxed);
+            let sent = sent_count.swap(0, Ordering::Relaxed);
+            let copy_total_ns = copy_ns.swap(0, Ordering::Relaxed);
+            let call_total_ns = call_ns.swap(0, Ordering::Relaxed);
             eprintln!(
-                "[stoat-capture-diag] pipewire dequeued={} sent={} (last ~2s)",
+                "[stoat-capture-diag] pipewire dequeued={} sent={} avg_copy_ms={:.2} avg_call_ms={:.2} (last ~2s)",
                 dequeued_count.swap(0, Ordering::Relaxed),
-                sent_count.swap(0, Ordering::Relaxed),
+                sent,
+                if sent > 0 { copy_total_ns as f64 / sent as f64 / 1_000_000.0 } else { 0.0 },
+                if sent > 0 { call_total_ns as f64 / sent as f64 / 1_000_000.0 } else { 0.0 },
             );
         }
     });
