@@ -24,6 +24,22 @@ if (started) {
 // disable hw-accel if so requested
 if (!config.hardwareAcceleration) {
   app.disableHardwareAcceleration();
+} else if (process.platform === "linux") {
+  // Rendering hardware acceleration (the toggle above) and WebRTC's
+  // hardware *video encoding* are separate Chromium switches -- having
+  // the former on doesn't turn on the latter. Without this, screen-share
+  // video (1080p+ especially) gets encoded entirely in software, which
+  // can't keep up in real time on a lot of hardware -- confirmed live as
+  // the actual bottleneck once the capture pipeline itself stopped being
+  // one (frames arriving fine, but the encoder falling behind and
+  // dropping most of them before they ever reach the network). VA-API is
+  // the Linux hardware video accel API (Mesa on AMD/Intel, proprietary
+  // driver on Nvidia); VaapiIgnoreDriverChecks covers drivers Chromium
+  // doesn't have on its own allowlist but that do work.
+  app.commandLine.appendSwitch(
+    "enable-features",
+    "VaapiVideoEncoder,VaapiVideoDecoder,VaapiIgnoreDriverChecks",
+  );
 }
 
 // ensure only one copy of the application can run

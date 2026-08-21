@@ -41,5 +41,14 @@ contextBridge.exposeInMainWorld("native", {
 
   screenShareEnded: () => ipcRenderer.send("screenShareEnded"),
 
+  // Replaces the `sources[0].id.startsWith("window:")` check the main
+  // process used to make on its own from Chromium's desktopCapturer
+  // source id -- now that the Rust capture addon (world/screenShareCapture.ts)
+  // does its own portal negotiation, only the renderer knows the picked
+  // source type (reported via the addon's onReady callback), so it has to
+  // tell the main process which decision to make.
+  pickScreenShareAudio: (opts: { isWindow: boolean }) =>
+    ipcRenderer.invoke("screenShareSourcePicked", opts),
+
   isWayland: () => ipcRenderer.invoke("getIsWayland"),
 });

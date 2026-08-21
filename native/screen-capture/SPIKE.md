@@ -1,5 +1,264 @@
 # Rust-owned screen capture -- spike notes
 
+## Session update (2026-08-21, later): RAM/CPU fixed and verified; "share
+## twice" bug still open
+
+### RAM/CPU/leak -- CONFIRMED FIXED, extensively tested
+
+Root causes (both real, both fixed):
+1. **`VideoFrame` was never `close()`d** in `screenShareAudio.ts`'s
+   `framePort.onmessage` handler -- a stale comment claimed `write()` took
+   ownership and closed it; confirmed live via a wrapped-`VideoFrame`
+   instrumentation that it does not. Every frame written leaked forever
+   (RSS 279MB -> 2GB+ in under 20s). Fixed: `vf.close()` in the
+   `write()`'s `.finally()`.
+2. **The Rust capture thread was never actually stopped** in two
+   situations: (a) when `getDisplayMedia`'s reuse-check failed and a
+   fresh capture was negotiated, the *previous* `activeCaptureHandleId`
+   was silently overwritten with nothing left to `stop()` it (confirmed
+   live: thread count climbing 66 -> 220+ across a handful of rounds).
+   Fixed in `startRustCapture()`: stop any still-active previous handle
+   before negotiating a new one. (b) When a round's track died without
+   its `'ended'` event ever firing (see below), the same leak recurred.
+   Fixed via the write-failure/`.enabled`-adjacent detection described
+   below (though see "still open" section -- this part is unfinished).
+
+Also tuned for a ~500MB RAM budget during an active share (target given
+by the user): capture resolution 1080p -> 720p, framerate 60fps -> 10fps
+(the app's own simulcast layers never used more than 13-15fps anyway,
+confirmed via real WebRTC stats), `mimalloc` as the crate's global
+allocator (glibc was holding onto the frequent multi-MB alloc/free
+pattern rather than returning it to the OS), and skipping the
+destination buffer's zero-init in `downscale_packed_4bpp` (every byte
+gets overwritten by the loop anyway). Result, confirmed live across many
+repeated share/stop cycles: RSS climbs to ~500MB during a share, settles
+back to ~380-400MB, stays flat -- no unbounded growth, no leaked
+threads.
+
+### Network -- migrated off the Oracle VPS relay entirely
+
+TURN was disabled in `livekit.yml` (root cause of most connection
+failures/timeouts) -- enabled it (`turn.enabled: true`, `udp_port: 3478`,
+`relay_range_start/end: 30000-30100`), which required: exposing those
+ports through the container (`compose.yml`), the VPS's iptables
+DNAT+FORWARD+MASQUERADE rules (both the PREROUTING/POSTROUTING *and* the
+FORWARD-chain ACCEPT rules -- the FORWARD chain's default DROP policy was
+silently eating the new ports even after DNAT correctly rewrote them,
+found by watching `iptables -t nat -L -v` packet counters going from 0 to
+nonzero only after adding those), and the corresponding Oracle Cloud
+Security List ingress rules (the OS-level firewall alone wasn't enough;
+confirmed via a real STUN round-trip test from outside).
+
+Given that worked, the whole self-hosted stack was migrated off the VPS
+entirely, straight to the user's home connection (confirmed real public
+IP, not CGNAT) via DuckDNS:
+- Ports 80/443 are ISP-blocked inbound (confirmed via direct TCP connect
+  tests -- 443 refused outright, 80 answered with something that clearly
+  wasn't Caddy) -- worked around by exposing on port 8443 instead
+  (already the container's host-mapped port, `8443:443` in `compose.yml`
+  -- no docker change needed, just router forwarding + updating every
+  `https://zerosecx.duckdns.org` reference to include `:8443`:
+  `Revolt.toml`, `stoat.json`, `.env.web` -- all on the LiveKit/app
+  server at `192.168.20.189`, all backed up with a `.bak-port8443` suffix
+  before editing).
+- Caddy's automatic HTTPS needs port 80 or 443 reachable for its default
+  ACME challenge -- neither works now, so switched to a DNS-01 challenge
+  via the DuckDNS API instead (needs no open port at all). Required a
+  custom Caddy build (`Dockerfile.caddy`, `caddy:2-builder` +
+  `xcaddy build --with github.com/caddy-dns/duckdns`) since the stock
+  `docker.io/caddy` image doesn't include DNS provider plugins;
+  `compose.yml`'s `caddy` service now builds from that instead of using
+  the bare image. `Caddyfile` got a `tls { dns duckdns {$DUCKDNS_TOKEN} }`
+  block; `DUCKDNS_TOKEN` added to `.env.web` (which `docker-compose.yml`
+  already wires as caddy's `env_file`).
+- A DuckDNS updater (`/opt/duckdns/update.sh` + a `*/5 * * * *` crontab
+  entry) now runs directly on `192.168.20.189` to keep the A record
+  pointed at the home connection's current IP.
+- `livekit.yml`'s `rtc.node_ip` (previously hardcoded to the VPS's static
+  IP) switched to `use_external_ip: true` instead, since a home IP can
+  change under DuckDNS -- this makes LiveKit auto-discover its current
+  public IP via STUN at startup rather than needing a manual update every
+  time the IP changes.
+- Confirmed end-to-end working directly (API, TLS cert, LiveKit) with
+  the VPS's WireGuard tunnel (`wg-quick.wg0`) stopped and removed from
+  boot. The VPS itself is no longer in the request path for this app at
+  all; safe to fully decommission whenever convenient.
+
+### Still open: screen share only works once per app session
+
+**Symptom**: first `getDisplayMedia`-driven share of an app session works
+correctly end-to-end (video publishes, is visible to other participants,
+audio works). After the user stops it and tries to share again, nothing
+visibly happens -- no picker, no error, `md.getDisplayMedia` (this
+patch's override) is never even re-entered. Confirmed via
+`stoatchat/for-web`'s own source (`packages/client/components/rtc/
+state.tsx`, `toggleScreenshare()`): there is exactly **one** call site
+that triggers `getDisplayMedia` --
+`room.localParticipant.setScreenShareEnabled(true, {...})` (LiveKit's own
+high-level API calls it internally) -- gated on the app's own reactive
+`this.screenshare()` state flag. If that flag is wrong (says "already
+sharing" when nothing real is being sent, or vice versa), the button does
+whatever's consistent with the *wrong* state, not the real one.
+
+**The mechanism, confirmed via source**: that same code attaches
+`localTrack.on("ended", () => { this.toggleScreenshare(); ... })` --
+*any* real `'ended'` event on the track this patch hands back is treated
+by the app as "the user closed the shared window," which fully stops
+sharing and flips `this.screenshare()` to false. This patch's own
+cleanup logic (`trackShareRound`'s `'ended'` listener) also depends on
+`'ended'` firing to release the Rust capture -- so both sides are relying
+on the same signal, but for different reasons, and disagreeing about
+when it should fire is exactly what's desynced.
+
+**What's confirmed AND ruled out this session**:
+- Live-observed repeatedly: shortly (variably, 1-13s) after a round
+  starts, the write path enters a burst of `InvalidStateError: ...
+  Stream closed` failures, self-resolving into what looks like a
+  provisional -> confirmed handoff (a second `getDisplayMedia` call,
+  reported as `readyState: ended` on the prior round -- this repeats on
+  *every* round, not just the first, going by thread/log timing, which
+  undercuts the "provisional round" theory somewhat).
+- Tried and reverted: treating `realVideoTrack.enabled === false` as "the
+  round ended" (a `pauseUpstream()`/`resumeUpstream()` false-positive
+  theory -- `toggleScreenshare()`'s quality-picker flow does call
+  `localTrack.pauseUpstream()`, which was suspected to set `.enabled =
+  false`, but removing this check did NOT reliably fix the symptom on
+  retest, so either the theory was wrong or it was only ever a partial
+  contributor).
+- Tried and reverted: `currentWriter.desiredSize === null` as an end
+  signal -- same result, didn't reliably fix it either.
+- Tried and reverted: gating the `InvalidStateError` end-signal on
+  `CONSECUTIVE_FAILURE_THRESHOLD` (5) consecutive frame failures instead
+  of the first one, to rule out a single transient failure as the
+  trigger -- did NOT fix the symptom on retest either, reverted back to
+  the simpler single-failure trigger.
+- Currently in place (as of this session's end, committed): (a) `write()`
+  rejecting with `InvalidStateError` ends the round on the very first
+  such failure (back to this after the consecutive-failures experiment
+  above didn't help), and (b) wrapping `console.log` to catch LiveKit's
+  own `"unpublishing track"` log line (confirmed this fires reliably for
+  the provisional->confirmed transition, but its correlation with the
+  actual *user-intended* stop hasn't been independently confirmed). This
+  combination was live-confirmed working for one full share/stop/reshare
+  cycle, then failed again on a later retest -- genuinely unresolved,
+  possibly flaky/multi-causal. Don't trust it as fixed.
+- **Not yet investigated**: whether the repeating ~1-13s `getDisplayMedia`
+  re-entry is coming from `state.tsx`'s own code at all, or from
+  somewhere inside `livekit-client`'s `setScreenShareEnabled()`
+  implementation itself (its source wasn't read this session -- only
+  `stoatchat/for-web`'s own code was). If that's LiveKit's own retry
+  logic (not this app's), the actual fix might be entirely different --
+  e.g. finding out *why* LiveKit's internal `setScreenShareEnabled` isn't
+  satisfied with the track handed back the first time, rather than
+  reacting to the symptom from this patch's side at all.
+- **Next concrete step**: clone `livekit-client` (npm, or
+  `github.com/livekit/client-sdk-js`) and read `setScreenShareEnabled`'s
+  actual implementation -- this session confirmed `stoatchat/for-web`
+  only calls it once, so any repeat negotiation is either inside that
+  SDK method or is this synthetic track failing some readiness check
+  LiveKit performs on it that a real captured track would pass
+  trivially (worth checking what, if anything, LiveKit reads from
+  `mediaStreamTrack.getSettings()`/`getCapabilities()` right after
+  `getDisplayMedia()` resolves -- a `MediaStreamTrackGenerator`'s output
+  track returns close to nothing meaningful from either).
+
+## Session update (2026-08-21): allocator + downscale RAM/CPU tuning
+
+Two small, low-risk changes to the per-frame hot path in `src/lib.rs`,
+aimed at the RSS-growth-during-a-share behavior noted below (confirmed
+"expected allocator behavior, not evidence of a leak" at the time, but
+worth tightening up now that this is wired into the real app, not just a
+standalone test):
+
+1. **`mimalloc` as the crate's global allocator.** The capture loop
+   allocates and frees one multi-megabyte frame buffer every frame (tens
+   of times a second) -- exactly the alloc/free-churn pattern glibc's
+   malloc tends to hold onto rather than return to the OS, which is what
+   RSS climbing-and-not-coming-back-down actually was. mimalloc returns
+   freed pages far more eagerly for this pattern. No change to the
+   capture/transfer pipeline itself.
+2. **Skip the destination buffer's zero-init in `downscale_packed_4bpp`.**
+   It was `vec![0u8; size]` (a full memset of the ~8MB 1080p destination
+   buffer) immediately before a loop that overwrites every byte of it
+   anyway. Now `Vec::with_capacity` + `set_len` (sound here -- the loop's
+   coverage is exhaustive, see the comment at the call site).
+
+Investigated and deliberately **not** done: a true reusable buffer pool
+(pre-allocate N buffers, hand them back and forth between Rust and JS
+instead of allocating fresh each frame). `screenShareCapture.ts` already
+hands frame ownership to the main world via a one-way `postMessage`
+*transfer* (not a `contextBridge` clone -- that was fixed earlier, see
+below), which is zero-copy but also one-way: once a frame's buffer
+crosses into the main world it can't come back to Rust for reuse without
+a new hand-back protocol (JS explicitly returning a buffer once its
+`VideoFrame` has copied out of it). That's real added complexity/surface
+for a gain that isn't demonstrated to be needed once the two changes
+above are measured -- left as a future option, not pursued here.
+
+## Session update (2026-08-20, later): wired up, working, bottleneck is network
+
+Full Electron integration is done and stable now (`src/world/screenShareCapture.ts`,
+`src/world/screenShareAudio.ts`, `src/native/window.ts` all wired). Key bugs found
+and fixed along the way, in case any regress:
+
+1. **Sandboxed preload can't load native addons at all** (`sandbox: false` now set
+   on both BrowserWindows using this preload -- `src/native/window.ts`).
+2. **`process.env` in preload doesn't reliably see WAYLAND_DISPLAY/XDG_SESSION_TYPE**
+   -- ask the main process via the existing `getIsWayland` IPC handler instead.
+3. **Node's ESM loader can't `import()` a `.node` file** (`ERR_UNKNOWN_FILE_EXTENSION`)
+   -- use `createRequire(addonPath)(addonPath)`, not dynamic `import()`.
+   `import.meta.url` is *not* usable as createRequire's base in this bundled
+   preload (resolves to the page's remote origin, not the real local path) --
+   use the already-known absolute `addonPath` itself instead.
+4. **contextBridge always clones, never transfers** (confirmed against
+   electron/electron#27024) -- frames now cross via a `MessageChannel`
+   set up in `screenShareCapture.ts` and requested on-demand by the main
+   world (`requestFramePort()`), NOT sent eagerly at preload-load time
+   (that raced the main world's listener attaching and silently dropped
+   the port -- confirmed live, broke the share button entirely for one
+   session).
+5. **`MediaStreamTrackGenerator.clone()` shares its writable stream with
+   the original** -- stopping a cloned "stale round" track (the
+   provisional->confirmed handoff `trackShareRound` already does) closed
+   the *original* generator's writer too, silently killing every future
+   `write()` after ~220 frames (`InvalidStateError: Stream closed`, only
+   found via real `RTCPeerConnection.getStats()` data, not logs). Fixed:
+   each round now gets its own independent `MediaStreamTrackGenerator`
+   via `createRustVideoTrack()`, all fed by the one ongoing Rust capture
+   -- no clone, no shared state, no renegotiation.
+6. **Frame rate/resolution tuning**: full native monitor res at 60-80fps
+   reliably froze the whole app (contextBridge clone + VideoFrame
+   construction cost on the main thread, confirmed via a minimal
+   addon-only Electron repro that had zero issue at the same rate --
+   isolating the cost to the JS-side pipeline, not the addon). Downscaling
+   in Rust (`downscale_packed_4bpp`, integer nearest-neighbor, precomputed
+   per-column not per-pixel) to a capped `MAX_FRAME_DIMENSION` fixed it.
+   Currently `1920` (1080p) in `src/lib.rs` -- was tried at `1280` (720p)
+   too, which reduced lag further (see item 7).
+7. **Remaining lag is NOT this addon, NOT Chromium's encoder, NOT CPU --
+   it's network bandwidth to the user's self-hosted LiveKit server**
+   (behind a WireGuard-tunneled Oracle VPS proxy). Confirmed via real
+   `RTCPeerConnection.getStats()` outbound-rtp data pulled live over CDP:
+   encode time ~6ms/frame (fast, not the bottleneck), `encoderImplementation:
+   "libvpx"` (software -- this AMD GPU's VA-API driver doesn't support VP8
+   hardware *encode*, despite `VaapiVideoEncoder` being enabled in
+   `src/main.ts`; decode-only support is common on AMD), but actual
+   achieved bitrate (~950kbps) far below LiveKit's own requested target
+   (~2.5Mbps) with `qualityLimitationReason: "none"` -- classic signature
+   of the network path (not the encoder) throttling throughput. Likely
+   Oracle's low outbound bandwidth tier and/or WireGuard MTU/overhead if
+   media (not just signaling) is routed through that tunnel. Nothing left
+   to fix here in this repo; next step is network-side (bandwidth test to
+   the VPS, checking whether LiveKit can ICE/TURN direct instead of
+   forcing media through the WireGuard hop).
+
+A temporary diagnostic (real WebRTC stats logged to console every 3s,
+`[stoat-stats]` prefix, plus `window.__stoatPCs` exposing live
+RTCPeerConnection instances for ad-hoc `getStats()` calls) is still in
+`screenShareAudio.ts`'s patch script -- harmless (logging only), safe to
+strip once the network-side investigation is done.
+
+
 ## Why this exists
 
 On Linux/Wayland, screen-share memory grows ~90-140MB per share and never
@@ -78,37 +337,86 @@ Tested directly from a plain Node script (no Electron yet):
 
 ## Not yet done (pick up here)
 
-1. **Format mapping**: `FrameData.format` is the raw SPA video format id
-   (currently observed as `12` on this system/compositor -- map the full
-   enum, e.g. via `libspa::param::video::VideoFormat`, to the
-   `VideoPixelFormat` strings `VideoFrame`'s constructor expects
-   (`BGRX`/`BGRA`/`RGBX`/`RGBA`/etc -- SPA and WebCodecs don't use the same
-   names, some formats have no WebCodecs equivalent and need a manual
-   swizzle or a fallback rejection).
-2. **Electron wiring**: a new `src/world/screenShareCapture.ts` (sibling
-   to the existing `screenShareAudio.ts`) that:
-   - `require()`s this addon directly in the preload/world context (NOT
-     via IPC to the main process -- see below for why).
-   - On the patched `getDisplayMedia()`, calls `startCapture()`, wraps
-     each `FrameData` into a `VideoFrame` fed to a
-     `MediaStreamTrackGenerator`'s writer, and returns a `MediaStream`
-     built from the generator's `.track` instead of whatever Chromium's
-     own `getDisplayMedia()` would have produced.
-   - Calls `.stop()` on the capture handle when the share truly ends
-     (same `liveRounds`-empty signal `screenShareAudio.ts` already uses).
-3. **Why preload, not main process**: frames are large (10-20MB each,
-   tens of them per second). Routing that through Electron IPC to the
-   main process and back would mean serializing/copying multi-hundred-
-   MB/s through `ipcRenderer`/`ipcMain` -- a new, self-inflicted
-   bottleneck (or leak). Loading the addon straight in the preload script
-   keeps capture and consumption (`MediaStreamTrackGenerator`) in the
-   *same* process, frames handed over as plain in-process JS callback
-   arguments, no serialization at all.
-4. **Render-test end to end**: confirm a `<video>` fed from the resulting
-   `MediaStreamTrack` actually shows a live, correct image inside the
-   real app (not just a synthetic Node script) before touching the real
-   `getDisplayMedia()` override in `src/world/screenShareAudio.ts`.
-5. **Packaging**: this crate currently only builds via plain `cargo
+1. ~~**Format mapping**~~ -- DONE. `FrameData` now carries `pixelFormat:
+   Option<String>` (via `spa_format_to_webcodecs()` in `src/lib.rs`),
+   mapping only the packed single-plane SPA formats the pixel-copy code
+   actually handles correctly (`RGBA`/`RGBx`/`BGRA`/`BGRx`) to their
+   `VideoPixelFormat` equivalents; anything else (e.g. `xRGB`/`ARGB` --
+   no WebCodecs equivalent -- or `I420`/`NV12`/etc, which the current
+   single-plane `datas_mut().first_mut()` read would corrupt) comes back
+   `None`, which the consumer must drop the frame for, not guess at. Also
+   fixed `stride` to read `chunk.stride()` directly instead of
+   approximating via `chunk_size / height` (wrong under row padding).
+   Verified live: `pixelFormat: 'BGRA'`, `stride: 10240` (=2560*4, no
+   padding on this system) over a fresh capture run, 10/10 frames, format
+   id `12` as before.
+2. ~~**Electron wiring**~~ -- DONE (pending the live render-test in item 4
+   below). `src/world/screenShareCapture.ts` is the preload-side bridge:
+   loads this addon and exposes `window.nativeScreenCapture` (raw frames
+   only -- see the corrected item 3 below for why). `src/world/screenShareAudio.ts`'s
+   existing `getDisplayMedia` patch was extended (not a second, separate
+   patch -- two independent `webFrame.executeJavaScript` injections would
+   race on which finishes wrapping `getDisplayMedia` first) to call the
+   bridge on Wayland instead of the original Chromium capture, build
+   `VideoFrame`s from the raw frames and feed a `MediaStreamTrackGenerator`,
+   and fall back to Chromium's own capture if the addon isn't available or
+   its portal negotiation fails. `src/native/window.ts` gained a
+   `screenShareSourcePicked` IPC handler so the "which app's audio" picker
+   (previously driven by Chromium's `desktopCapturer` source id prefix)
+   still works, now driven by the addon's own `onReady` source-type
+   report instead.
+3. **Why preload, not main process (corrected)**: frames are large
+   (10-20MB each, tens of them per second). Routing them through
+   `ipcRenderer`/`ipcMain` to the main process and back would mean
+   serializing/copying multi-hundred-MB/s across an OS-level process
+   boundary -- a new, self-inflicted bottleneck (or leak). Loading the
+   addon in the preload/renderer process instead avoids that. **What
+   this spike got wrong**: it isn't "no serialization at all" -- a real
+   Electron security advisory (context-isolation bypass when a
+   `VideoFrame` crosses `contextBridge`, GHSA-jfqg-hf23-qpw2) plus the
+   fact that `MediaStreamTrack` isn't structured-clonable across the
+   bridge at all means the `MediaStreamTrackGenerator`/`VideoFrame`
+   objects can't be built in preload's isolated world and handed to the
+   page as this spike assumed. Only *raw* frame data (a Buffer + plain
+   width/height/stride/pixelFormat, all safely clonable) crosses the
+   preload -> main-world boundary; `VideoFrame`/`MediaStreamTrackGenerator`
+   are built in the main world instead, where `getDisplayMedia`'s patch
+   already runs. That's still one real in-process memory copy per frame
+   (via `contextBridge`'s structured clone), just not the OS-process IPC
+   round trip this reasoning was correctly trying to avoid.
+4. ~~**Render-test end to end**~~ -- DONE. Live-tested in a real `pnpm
+   start` session: sharing a window renders correctly via the Rust
+   capture path (confirmed no second Chromium portal dialog, real video
+   showed up). Found and fixed one real bug along the way: Electron's
+   `setDisplayMediaRequestHandler` callback throws (`TypeError: audio
+   must be a WebFrameMain, "loopback" or "loopbackWithMute"`) on an
+   *explicit* `audio: undefined` -- the key must be omitted entirely, not
+   present-with-undefined. Two call sites in `src/native/window.ts` had
+   this (one pre-existing, in the multi-source picker branch, unrelated
+   to this session's changes but the same bug class -- fixed both).
+5. **Dead end, don't retry**: tried to make the "which app's audio"
+   picker unnecessary by reading the captured window's owning app-id
+   directly, instead of asking. On this system (KDE/KWin), a *fully
+   unrestricted* `pw-dump` shows the source node's `media.name` as
+   `kwin-screencast-<app-id>` (e.g. `kwin-screencast-org.mozilla.firefox`)
+   -- looks like a free win. It isn't: confirmed live (via a temporary
+   `eprintln!` in the registry's `global` listener, since removed) that
+   the *portal-restricted* PipeWire connection our addon actually uses
+   (opened via `open_pipe_wire_remote`) exposes a deliberately reduced
+   property set for that same node -- `object.serial`, `factory.id`,
+   `client.id`, `node.name` ("kwin_wayland", the compositor itself, not
+   the captured app), `media.class` -- with `media.name` stripped out
+   entirely. This isn't a bug or a timing issue on our end -- it's the
+   compositor deliberately keeping the sandboxed connection from
+   revealing what it's capturing, the same privacy boundary that's the
+   entire reason the audio-app picker exists in the first place (also
+   confirmed absent from ashpd's own `Stream` type at the DBus/portal API
+   level, checked directly in its source). No known way around this
+   without cooperation from the portal/compositor itself -- see
+   [flatpak/xdg-desktop-portal#1064](https://github.com/flatpak/xdg-desktop-portal/issues/1064),
+   an open feature request for exactly this, unresolved as of this
+   session.
+6. **Packaging**: this crate currently only builds via plain `cargo
    build` + manually copying the `.so` to `.node`. For real packaging
    into the app (and CI), it needs the same treatment `node-pipewire`
    gets in `forge.config.ts` -- likely `@napi-rs/cli` for proper
@@ -116,7 +424,7 @@ Tested directly from a plain Node script (no Electron yet):
    `pipewire-devel`, `clang-libs`, and `glibc-devel`/`gcc` installed from
    scratch -- the GitHub Actions `build-appimage` container will need the
    same).
-6. **Multi-monitor / window-switch UX**: this spike only exercises "pick
+7. **Multi-monitor / window-switch UX**: this spike only exercises "pick
    one source once." The real feature needs to handle what happens if
    the user shares a *different* window mid-session, resolution changes
    (a monitor's refresh rate/resolution can change while sharing), and
@@ -142,3 +450,15 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/clang/22/include"
 
 (adjust the clang version number to whatever `rpm -q clang-libs` /
 `ls /usr/lib/clang/` reports locally.)
+
+To actually exercise the Electron wiring (item 2 above) in a local dev
+`pnpm start`, `src/world/screenShareCapture.ts` loads the built addon from
+a fixed path -- copy the build output there after every `cargo build`:
+
+```
+cargo build
+cp target/debug/libscreen_capture.so index.node
+```
+
+(run from `native/screen-capture/`; `index.node` is gitignored). This is
+dev-only -- see item 5, there's no real packaging yet.

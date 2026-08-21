@@ -305,6 +305,9 @@ async function showAudioSharePicker(
       preload: join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      // Same reasoning as the main window's webPreferences below -- this
+      // shares the same bundled preload.js, which requires it too.
+      sandbox: false,
     },
   });
 
@@ -343,6 +346,47 @@ async function showAudioSharePicker(
       }),
     )}`,
   );
+}
+
+/**
+ * Decide what screen-share audio routing to apply for a freshly picked
+ * source, and (for a Wayland window share) show the app picker and wait
+ * for a choice. Shared between `setDisplayMediaRequestHandler` below
+ * (used when Chromium/desktopCapturer picked the source -- now only the
+ * fallback path, for when the Rust capture addon isn't available) and the
+ * `screenShareSourcePicked` IPC handler (used when the renderer's own
+ * portal negotiation, via the addon, picked the source instead -- see
+ * world/screenShareCapture.ts). Either way `showAudioSharePicker`,
+ * `getActiveAudioApps`, and `setAudioCaptureMode` don't care how the
+ * source was picked, only what apps are running and what mode the user
+ * chooses, so this logic didn't need to change, just be reachable from
+ * two call sites instead of one.
+ */
+async function resolveScreenShareAudioMode({
+  isWindow,
+  audioRequested,
+}: {
+  isWindow: boolean;
+  audioRequested: boolean;
+}): Promise<void> {
+  if (!audioRequested) return;
+
+  // On Wayland the screen-capture portal doesn't tell us which window
+  // was picked (only whether it was a window at all) -- so when it's a
+  // specific window, ask which app's audio to include instead of always
+  // grabbing everything.
+  if (isWayland && isWindow) {
+    const apps = getActiveAudioApps();
+    await new Promise<void>((resolve) => {
+      showAudioSharePicker(apps, (mode) => {
+        setAudioCaptureMode(mode);
+        resolve();
+      });
+    });
+    return;
+  }
+
+  setAudioCaptureMode({ type: "all" });
 }
 
 /**
@@ -451,6 +495,17 @@ export function createMainWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       spellcheck: true,
+      // Electron's sandboxed preload (the default since Electron 20) only
+      // exposes a curated require() -- electron's own modules plus a
+      // handful of Node builtins -- and categorically cannot load native
+      // addons via require()/process.dlopen() at all (confirmed against
+      // electron/electron#36012). world/screenShareCapture.ts requires
+      // the Rust screen-capture addon (native/screen-capture) directly
+      // from the preload script, which needs the unrestricted preload
+      // Node environment this turns back on. contextIsolation stays on
+      // above -- the page's own JS still has no Node/require access,
+      // only this preload script does.
+      sandbox: false,
     },
   });
 
@@ -670,45 +725,48 @@ export function createMainWindow() {
         .getSources({ types: ["screen", "window"], fetchWindowIcons: true })
         .then((sources) => {
           // Shortcut for linux wayland.
+          //
+          // This whole branch is now only exercised as a fallback: on
+          // Wayland, world/screenShareAudio.ts's patched getDisplayMedia
+          // does its own portal negotiation via the Rust capture addon
+          // (world/screenShareCapture.ts) rather than calling through to
+          // here, precisely to avoid Chromium's own capture pipeline (the
+          // native memory leak this addon exists to route around -- see
+          // native/screen-capture/SPIKE.md). This still runs -- and still
+          // needs to work correctly -- when the addon isn't available
+          // (not built for this platform/arch yet) or its portal
+          // negotiation fails, so a screen share never just breaks.
           if (sources.length == 1) {
-            if (!request.audioRequested) {
-              callback({ video: sources[0] });
-              return;
-            }
-
-            // On Wayland the screen-capture portal doesn't tell us which
-            // window was picked (only whether it was a window at all, via
-            // the id prefix) -- so when it's a specific window, ask which
-            // app's audio to include instead of always grabbing everything.
-            if (isWayland && sources[0].id.startsWith("window:")) {
-              const apps = getActiveAudioApps();
-              showAudioSharePicker(apps, (mode) => {
-                setAudioCaptureMode(mode);
-                // No `audio` here: on this Chromium build "loopback" is
-                // no longer the documented Windows-only no-op -- it does
-                // a real capture of the physical output device's
-                // monitor, i.e. everything playing on the machine. That
-                // would run *alongside* the per-app audio our own patch
-                // (world/screenShareAudio.ts) stitches on afterwards,
-                // doubling up into exactly the "other apps' audio /
-                // hearing your own voice back" leak this mode exists to
-                // avoid. Video-only here; the renderer-side patch is the
-                // only source of audio for a Wayland window share.
-                callback({ video: sources[0] });
-              });
-              return;
-            }
-
-            setAudioCaptureMode({ type: "all" });
-            // Same reasoning as the window-share branch above: on
-            // Wayland, real "loopback" audio would duplicate what the
-            // renderer-side patch already adds via the virtual sink/
-            // source. Only fall back to native loopback where our own
-            // audio path doesn't exist (non-Wayland platforms, where
-            // setAudioCaptureMode above is already a no-op).
-            callback({
-              video: sources[0],
-              audio: isWayland ? undefined : "loopback",
+            const isWindow = isWayland && sources[0].id.startsWith("window:");
+            resolveScreenShareAudioMode({
+              isWindow,
+              audioRequested: request.audioRequested,
+            }).then(() => {
+              // Electron's callback() validates `audio` strictly -- it
+              // must be a WebFrameMain, "loopback"/"loopbackWithMute", or
+              // the key must be absent entirely. An explicit `audio:
+              // undefined` throws (`TypeError: audio must be a
+              // WebFrameMain, "loopback" or "loopbackWithMute"`), so the
+              // key can't just always be present with a possibly-undefined
+              // value the way the rest of this file's object literals
+              // usually work.
+              //
+              // No `audio` here for a Wayland window share (handled by
+              // resolveScreenShareAudioMode's picker) or on Wayland
+              // generally: on this Chromium build "loopback" is no
+              // longer the documented Windows-only no-op -- it does a
+              // real capture of the physical output device's monitor,
+              // i.e. everything playing on the machine. That would run
+              // *alongside* the per-app audio our own patch
+              // (world/screenShareAudio.ts) stitches on afterwards,
+              // doubling up into exactly the "other apps' audio /
+              // hearing your own voice back" leak this mode exists to
+              // avoid.
+              callback(
+                request.audioRequested && !isWayland
+                  ? { video: sources[0], audio: "loopback" }
+                  : { video: sources[0] },
+              );
             });
             return;
           }
@@ -732,13 +790,13 @@ export function createMainWindow() {
               respondToPicker({});
             } else {
               respondToPicker(
-                audio
-                  ? {
-                      video: sources[idx],
-                      // see the isWayland comment above -- avoid
-                      // duplicating the renderer-side audio patch
-                      audio: isWayland ? undefined : "loopback",
-                    }
+                audio && !isWayland
+                  ? // see the isWayland comment above -- avoid duplicating
+                    // the renderer-side audio patch. `audio` must be
+                    // omitted entirely (not `undefined`) when unset --
+                    // Electron's callback() throws on an explicit
+                    // `audio: undefined`.
+                    { video: sources[idx], audio: "loopback" }
                   : { video: sources[idx] },
               );
             }
@@ -780,6 +838,20 @@ export function createMainWindow() {
     { useSystemPicker: true },
   );
 
+  // Renderer's own portal negotiation (world/screenShareCapture.ts) picked
+  // the source; it only knows whether that source was a window, not what
+  // apps are running -- ask this process to make the same audio-routing
+  // decision the fallback branch above makes when Chromium/desktopCapturer
+  // picked the source instead.
+  ipcMain.handle(
+    "screenShareSourcePicked",
+    (_event, opts: { isWindow: boolean }) =>
+      resolveScreenShareAudioMode({
+        isWindow: opts.isWindow,
+        audioRequested: true,
+      }),
+  );
+
   // push world events to the window
   ipcMain.on("minimise", () => mainWindow.minimize());
   ipcMain.on("maximise", () =>
@@ -787,7 +859,7 @@ export function createMainWindow() {
   );
   ipcMain.on("close", () => mainWindow.close());
 
-  // mainWindow.webContents.openDevTools();
+  mainWindow.webContents.openDevTools();
 
   // let i = 0;
   // setInterval(() => setBadgeCount((++i % 30) + 1), 1000);
