@@ -37,6 +37,12 @@ function sameMode(a: AudioCaptureMode, b: AudioCaptureMode) {
 // actual screen share picks a mode, not from the moment the app boots.
 let audioCaptureMode: AudioCaptureMode = { type: "none" };
 
+// Node names this app has already warned about being unsafe to link (see
+// the unsafeNames check in runLinkingTick() below) -- kept across ticks so
+// the same collision doesn't spam the console once a second for as long
+// as the offending app stays open.
+const warnedUnsafeNames = new Set<string>();
+
 // Guards the periodic linking loop below against the async destroy+
 // recreate sequence in setAudioCaptureMode(): for the ~300ms that takes,
 // `sinkNode` briefly refers to an already-destroyed node (or hasn't been
@@ -56,6 +62,7 @@ let modeSwitchInFlight = false;
 let pw: {
   getNodes: () => any[];
   getLinks: () => any[];
+  getClients: () => any[];
   linkNodesNameToId: (name: string, id: number, permanent: boolean) => void;
   createSink: (name: string, channels: string[], monitor: boolean) => void;
   destroyObject: (id: number) => void;
@@ -129,6 +136,38 @@ export function getActiveAudioApps(): string[] {
 }
 
 /**
+ * PipeWire client IDs belonging to this app's own OS processes. Matching
+ * only the main process's pid isn't enough: Chromium runs its Audio
+ * Service (and GPU process, etc.) out-of-process, so the PipeWire client
+ * that actually owns this app's own audio-output node is commonly a
+ * *subprocess*, not the main process -- confirmed live against a running
+ * instance of this app, where the audio-output node's
+ * application.process.id was the AudioService utility process's pid, not
+ * process.pid. app.getAppMetrics() returns every OS process this
+ * Electron app owns (browser, gpu, utility, renderers), so matching
+ * against that whole set instead of a single pid covers this case.
+ * Re-derived fresh on every call, same reasoning as linkedNodeIds in
+ * runLinkingTick() below: this app's own process set (and PipeWire's
+ * client list) can change over the life of the app, so a permanent cache
+ * risks going stale.
+ */
+function getOwnClientIds(): Set<number> {
+  if (!pw) return new Set();
+
+  const ownPids = new Set(app.getAppMetrics().map((p) => p.pid));
+  const ownName = app.getName();
+  const ids = new Set<number>();
+
+  for (const client of pw.getClients()) {
+    if (ownPids.has(client.pid) || client.application_name === ownName) {
+      ids.add(client.id);
+    }
+  }
+
+  return ids;
+}
+
+/**
  * Re-derives which apps should be linked into the screen-share sink and
  * links any that aren't already. This used to be the body of a
  * `setInterval(..., 1000)` fired unconditionally for the app's whole
@@ -159,12 +198,32 @@ function runLinkingTick() {
   // surfaces in the console instead.
   try {
     // every app currently outputting audio, minus our own
+    const ownClientIds = getOwnClientIds();
+
     const audioNodes = pw
       .getNodes()
       .filter(
         (node: any) => node.props["media.class"] === "Stream/Output/Audio",
       )
-      .filter((node: any) => node.props["application.name"] !== app.getName());
+      .filter((node: any) => {
+        const name = node.props["application.name"];
+        // A node PipeWire hasn't finished tagging yet (application.name not
+        // populated -- happens briefly right after the node is first
+        // announced, before this app's own properties have propagated) is
+        // treated as "possibly ours, don't link it yet" rather than "not
+        // ours, safe to link": the loop below only ever adds links, never
+        // removes ones that turn out to be wrong once props settle (see its
+        // own comment above), so linking an unresolved node now could make
+        // a race-condition self-link permanent for the rest of the share.
+        if (!name) return false;
+        // Exclude this app's own audio by application name (existing check).
+        if (name === app.getName()) return false;
+        // Exclude by PipeWire client ID when available -- catches cases
+        // where application.name is missing, different, or the app's
+        // audio is produced by a subprocess with a different name.
+        if (ownClientIds.has(Number(node.props["client.id"]))) return false;
+        return true;
+      });
 
     // of those, which ones the current capture mode wants included
     const desired = audioNodes.filter((node: any) => {
@@ -173,6 +232,41 @@ function runLinkingTick() {
       }
       return true;
     });
+
+    // linkNodesNameToId() links by exact node.name match against *every*
+    // node currently on the graph with that name, not just the specific
+    // id it was resolved from -- confirmed against node-pipewire's own
+    // pipewire_thread.rs. Some apps register more than one node under the
+    // identical name for different roles: TeamSpeak, for one, has both a
+    // "TeamSpeak" playback node (Stream/Output/Audio, what desired above
+    // means to link) and a "TeamSpeak" capture-monitor node
+    // (Stream/Input/Audio, mirroring back whatever TeamSpeak's mic input
+    // is currently picking up). Linking the first by name silently links
+    // the second too, and if that mic input happens to be a monitor of
+    // the system's default output (a real TeamSpeak config seen in
+    // practice), the capture-monitor node re-injects a remote call
+    // participant's own voice -- already played locally through this
+    // app's own audio -- straight back into the screen-share "system
+    // audio" sink, i.e. that participant hears themselves echoed back.
+    // Building this map from *all* graph nodes (not just audioNodes,
+    // which already dropped every Stream/Input/Audio node) is what makes
+    // the collision visible at all.
+    const nodesByName = new Map<string, any[]>();
+    for (const node of pw.getNodes()) {
+      const list = nodesByName.get(node.name);
+      if (list) list.push(node);
+      else nodesByName.set(node.name, [node]);
+    }
+    const unsafeNames = new Set<string>();
+    for (const [name, nodesWithName] of nodesByName) {
+      if (
+        nodesWithName.some(
+          (n: any) => n.props["media.class"] !== "Stream/Output/Audio",
+        )
+      ) {
+        unsafeNames.add(name);
+      }
+    }
 
     // Which desired nodes are *actually* linked into the sink right now,
     // checked fresh every time rather than assumed from a "linked once,
@@ -195,9 +289,19 @@ function runLinkingTick() {
 
     for (const node of desired) {
       const idAsNum = Number(node.id);
-      if (!linkedNodeIds.has(idAsNum)) {
-        pw.linkNodesNameToId(node.name, sinkNode.id, false);
+      if (linkedNodeIds.has(idAsNum)) continue;
+
+      if (unsafeNames.has(node.name)) {
+        if (!warnedUnsafeNames.has(node.name)) {
+          warnedUnsafeNames.add(node.name);
+          console.warn(
+            `[stoat] skipping screen-share audio link for "${node.name}": another PipeWire node shares this exact name but isn't a plain audio-output stream, and linkNodesNameToId links every node with that name at once -- linking would pull the other one in too.`,
+          );
+        }
+        continue;
       }
+
+      pw.linkNodesNameToId(node.name, sinkNode.id, false);
     }
   } catch (err) {
     console.error("[stoat] screen-share audio linking tick failed:", err);
@@ -408,13 +512,21 @@ export async function initVirtualMic() {
       createSource,
       getNodes,
       getLinks,
+      getClients,
       linkNodesNameToId,
       destroyObject,
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       //@ts-ignore This module may not be found on non-linux builds.
     } = await import("node-pipewire"); //eslint-disable-line
 
-    pw = { getNodes, getLinks, linkNodesNameToId, createSink, destroyObject };
+    pw = {
+      getNodes,
+      getLinks,
+      getClients,
+      linkNodesNameToId,
+      createSink,
+      destroyObject,
+    };
 
     createPwThread();
 
