@@ -859,7 +859,9 @@ export function createMainWindow() {
   );
   ipcMain.on("close", () => mainWindow.close());
 
-  mainWindow.webContents.openDevTools();
+  if (app.commandLine.hasSwitch("debug")) {
+    mainWindow.webContents.openDevTools();
+  }
 
   // let i = 0;
   // setInterval(() => setBadgeCount((++i % 30) + 1), 1000);

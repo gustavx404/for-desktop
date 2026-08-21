@@ -31,94 +31,6 @@ function buildPatchScript(isWayland: boolean) {
   if (!md || md.__stoatAudioPatched) return;
   md.__stoatAudioPatched = true;
 
-  // Temporary diagnostic: logs real WebRTC outbound-video encoder stats
-  // every few seconds for every RTCPeerConnection the page creates.
-  // qualityLimitationReason ("cpu" vs "bandwidth" vs "none") and
-  // encoderImplementation (a software codec name vs a hardware/VAAPI
-  // one) answer "why is it laggy" directly instead of guessing at it
-  // from the capture side, which -- as of this session -- is no longer
-  // where the bottleneck has been shown to be. Safe to remove once
-  // that's answered; doesn't change any behavior, only logs.
-  if (window.RTCPeerConnection && !window.RTCPeerConnection.__stoatStatsPatched) {
-    const OriginalRTCPeerConnection = window.RTCPeerConnection;
-    window.__stoatPCs = [];
-    let stoatPcCounter = 0;
-    function StoatRTCPeerConnection(...args) {
-      const pc = new OriginalRTCPeerConnection(...args);
-      // Diagnostic (2026-08-21): livekit-client's PCTransportManager
-      // always creates exactly one "publisher" PC first, then one
-      // "subscriber" PC immediately after (PCTransportManager.ts's own
-      // constructor) -- multiple sessions of this app showed 3 PCs total
-      // with one appearing "stuck" (framesSent frozen shortly after
-      // starting a share), suspected to be a disposable "provisional
-      // round" but never confirmed. __stoatIndex (creation order) plus a
-      // live role guess (does this PC actually have an active outbound
-      // video sender right now, independent of getStats() polling)
-      // answers directly whether the stuck PC is really the live
-      // publisher (a real problem) or a leftover round (expected/benign).
-      pc.__stoatIndex = stoatPcCounter++;
-      window.__stoatPCs.push(pc);
-      const interval = setInterval(() => {
-        if (pc.connectionState === "closed") {
-          clearInterval(interval);
-          return;
-        }
-        const videoSenders = pc.getSenders().filter(
-          (s) => s.track && s.track.kind === "video",
-        );
-        const role = videoSenders.length > 0 ? "has-active-video-sender" : "no-video-sender";
-        pc.getStats().then((stats) => {
-          stats.forEach((report) => {
-            if (report.type === "outbound-rtp" && report.kind === "video") {
-              console.log("[stoat-stats] outbound video:", JSON.stringify({
-                pcIndex: pc.__stoatIndex,
-                pcRole: role,
-                pcSignalingState: pc.signalingState,
-                frameWidth: report.frameWidth,
-                frameHeight: report.frameHeight,
-                framesPerSecond: report.framesPerSecond,
-                framesSent: report.framesSent,
-                framesEncoded: report.framesEncoded,
-                qualityLimitationReason: report.qualityLimitationReason,
-                bytesSent: report.bytesSent,
-                targetBitrate: report.targetBitrate,
-                encoderImplementation: report.encoderImplementation,
-                powerEfficientEncoder: report.powerEfficientEncoder,
-              }));
-            }
-            // Diagnostic (2026-08-21): targetBitrate is stuck at 2.5Mbps
-            // regardless of quality tier, and a real upload-speed test
-            // ruled out the user's own link (90Mbps measured) as the
-            // cause -- this answers whether media is flowing P2P direct
-            // (localType/remoteType "host"/"srflx") or through the TURN
-            // relay ("relay"), which points the next step at either the
-            // network path or the relay server's own config/bandwidth
-            // instead of guessing further.
-            if (report.type === "candidate-pair" && report.nominated && report.state === "succeeded") {
-              const local = stats.get(report.localCandidateId);
-              const remote = stats.get(report.remoteCandidateId);
-              console.log("[stoat-stats] selected candidate pair:", JSON.stringify({
-                pcIndex: pc.__stoatIndex,
-                pcRole: role,
-                localType: local && local.candidateType,
-                remoteType: remote && remote.candidateType,
-                localPort: local && local.port,
-                remotePort: remote && remote.port,
-                availableOutgoingBitrate: report.availableOutgoingBitrate,
-                bytesSent: report.bytesSent,
-                currentRoundTripTime: report.currentRoundTripTime,
-              }));
-            }
-          });
-        });
-      }, 3000);
-      return pc;
-    }
-    StoatRTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
-    StoatRTCPeerConnection.__stoatStatsPatched = true;
-    window.RTCPeerConnection = StoatRTCPeerConnection;
-  }
-
   const originalGetDisplayMedia = md.getDisplayMedia.bind(md);
 
   // Only one of these captures should ever be open at a time.
@@ -264,14 +176,9 @@ function buildPatchScript(isWayland: boolean) {
   // synchronously, and needs to see the new round already present to
   // know a handoff -- not the whole share -- is what's happening.
   function handleRoundEnded(videoTrack) {
-    console.log("[stoat-share-diag] handleRoundEnded", {
-      liveRoundsBefore: liveRounds.size,
-      alreadyHandled: !liveRounds.has(videoTrack),
-    });
     if (!liveRounds.has(videoTrack)) return; // already handled
     liveRounds.delete(videoTrack);
     if (liveRounds.size > 0) return;
-    console.log("[stoat-share-diag] handleRoundEnded: last round, tearing down share");
     // Belt-and-braces: whatever the app actually stopped (the original
     // or a clone of it), make sure the real underlying capture is
     // stopped too rather than assuming it already was. Re-entrant safe:
@@ -304,7 +211,6 @@ function buildPatchScript(isWayland: boolean) {
 
     const nativeStop = videoTrack.stop.bind(videoTrack);
     videoTrack.stop = function () {
-      console.log("[stoat-share-diag] track.stop() called", new Error().stack);
       nativeStop();
       handleRoundEnded(videoTrack);
     };
@@ -376,33 +282,6 @@ function buildPatchScript(isWayland: boolean) {
   let currentWriter = null;
   let writeBusy = false;
   let loggedUnsupportedFormat = false;
-  // Temporary diagnostic (2026-08-21): real WebRTC stats showed the
-  // encoder receiving far fewer frames than this addon actually sends
-  // (e.g. ~40fps sent by the Rust addon, ~15fps encoded) -- these
-  // counters (received: every framePort message; droppedWriteBusy: an
-  // in-flight write() blocking the next frame; droppedDesiredSize: the
-  // writable stream's own backpressure; written: currentWriter.write()
-  // actually called), logged every 2s, answer whether the loss is this
-  // patch's own writeBusy/backpressure gating or something downstream of
-  // it (VideoFrame construction cost, or Chromium's own internal
-  // encode/send queue). Remove once that's answered.
-  let diagReceived = 0;
-  let diagDroppedWriteBusy = 0;
-  let diagDroppedDesiredSize = 0;
-  let diagWritten = 0;
-  setInterval(() => {
-    if (diagReceived === 0) return;
-    console.log("[stoat-frame-diag]", {
-      received: diagReceived,
-      droppedWriteBusy: diagDroppedWriteBusy,
-      droppedDesiredSize: diagDroppedDesiredSize,
-      written: diagWritten,
-    });
-    diagReceived = 0;
-    diagDroppedWriteBusy = 0;
-    diagDroppedDesiredSize = 0;
-    diagWritten = 0;
-  }, 2000);
   // Used to give each VideoFrame a real duration (below) instead of
   // leaving it unset -- LiveKit/WebRTC's own frame-rate detection and
   // pacing use it, same as any other video source's actual frame timing
@@ -413,7 +292,6 @@ function buildPatchScript(isWayland: boolean) {
   framePortReady.then(() => {
     framePort.onmessage = (event) => {
       const frame = event.data;
-      diagReceived++;
       if (!currentWriter) return;
       // NOTE: deliberately NOT treating realVideoTrack.enabled === false as
       // "this round ended" (an earlier version of this check did, and it
@@ -444,7 +322,6 @@ function buildPatchScript(isWayland: boolean) {
         return;
       }
       if (writeBusy) {
-        diagDroppedWriteBusy++;
         return;
       }
       // currentWriter.write()'s returned promise resolves as soon as the
@@ -464,10 +341,8 @@ function buildPatchScript(isWayland: boolean) {
       // here (same as the writeBusy/pixelFormat drops above) means it's
       // simply never constructed -- nothing to leak.
       if ((currentWriter.desiredSize ?? 1) <= 0) {
-        diagDroppedDesiredSize++;
         return;
       }
-      diagWritten++;
       writeBusy = true;
       const timestamp = Math.round(performance.now() * 1000);
       const vf = new VideoFrame(frame.data, {
@@ -669,13 +544,6 @@ function buildPatchScript(isWayland: boolean) {
   md.getDisplayMedia = async function (constraints) {
     let stream;
     let rustSourceType = null;
-
-    console.log("[stoat-share-diag] getDisplayMedia called", {
-      usingRustCapture,
-      hasRealVideoTrack: !!realVideoTrack,
-      realVideoTrackReadyState: realVideoTrack?.readyState,
-      msSinceCaptureStart: Date.now() - lastCaptureStartedAt,
-    });
 
     if (
       IS_WAYLAND &&
