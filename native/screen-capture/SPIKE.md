@@ -57,21 +57,48 @@ raw encoder throughput is also capping it around 15fps at this resolution
 `VideoFrame` construction cost, or some other fixed-cost stage in the
 pipeline, per the sixth session's per-thread CPU breakdown).
 
-**Still open, not resolved this session**: why Chromium (this Electron
-build) picks the software `OpenH264` encoder for WebRTC instead of the
-VA-API hardware H264 encoder confirmed working via `ffmpeg` (seventh
-session). `chrome://gpu` is not reachable via CDP in this Electron build
-(`Target.createTarget` for a `chrome://` URL returns "Not supported"),
-which would have been the direct way to check video-encode-acceleration
-status. The `--enable-features=VaapiVideoEncoder` flag already present
-(`src/main.ts`) is evidently not sufficient on its own to route WebRTC's
-own encoder factory to hardware -- there is likely an additional,
-more-specific flag or build-time requirement (Chromium's WebRTC hardware
-H264 encode support has historically been partial/flag-gated even when
-general VA-API hardware video is otherwise working) that a future session
-should investigate directly against Chromium's own source/flags rather than
-guessing further. NVIDIA (CachyOS) and Intel (Pop!_OS) validation, planned
-in the seventh session, also still not done.
+**Resolved, same day, ninth session**: the missing piece was a second,
+newer feature flag. `--enable-features=VaapiVideoEncoder` alone was
+confirmed NOT to route WebRTC's own encoder factory to hardware --
+`chrome://gpu` isn't reachable via CDP in this Electron build
+(`Target.createTarget` for a `chrome://` URL returns "Not supported"), so
+this was found via web research rather than direct inspection: as of
+Chromium 131, `AcceleratedVideoEncoder` is the real gate for hardware
+video *encode* specifically (this Electron ships Chromium 150). Added to
+`src/main.ts`'s `enable-features` list. **Confirmed live, immediately**:
+`encoderImplementation` in real `RTCPeerConnection.getStats()` output
+switched from `"OpenH264"` to `"VaapiVideoEncodeAccelerator"`,
+`powerEfficientEncoder: true`, and renderer CPU during an active
+2560x1440 share dropped from ~300% (software VP8, sixth session) to
+~160% (hardware H264, this session) -- genuine hardware encode, working
+end to end, on this AMD GPU.
+
+**fps ceiling, partially addressed, not fully solved**: even with
+hardware encode confirmed active and `targetBitrate` climbing well past
+1.5Mbps toward the "ultra" tier's 8Mbps ceiling, fps stayed pinned at
+*exactly* 15 across every sample -- suspicious given real bitrate-driven
+adaptation is normally gradual, not a hard constant. Root-caused (web
+research, not Chromium source) to WebRTC's default `degradationPreference`
+("balanced") trading framerate away to preserve per-frame resolution/
+quality for screen-share content specifically -- a well-documented WebRTC
+default behavior, not a bug in this codebase. Set
+`degradationPreference: "maintain-framerate"` in `state.tsx`'s
+`TrackPublishOptions` (matching the existing `contentHint: "motion"`
+already set per-tier). **Result, live-tested**: fps stopped being a hard
+constant 15 (now varies ~13-17), a real but modest change -- did not
+unlock anywhere close to the ~40fps the Rust addon actually delivers
+cleanly (confirmed via `[stoat-frame-diag]`'s own received/written
+counters, zero drops, unchanged this whole investigation). The remaining
+~15fps plateau with hardware encode active and bitrate genuinely rising is
+not yet explained -- worth a fresh, focused investigation (real network
+path characteristics on the actual production LiveKit deployment now
+being tested against, vs. the sixth session's LAN test; or a deeper look
+at libwebrtc's own screen-content-specific rate control, not something
+resolvable through client-side flags alone based on what's been tried so
+far).
+
+**Not yet done**: NVIDIA (CachyOS) and Intel (Pop!_OS) validation, planned
+since the seventh session.
 
 ## Session update (2026-08-21, seventh session): AMD hardware H264/HEVC
 ## encode CONFIRMED working after fixing the missing VA-API driver -- the
