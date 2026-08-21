@@ -36,9 +36,23 @@ if (!config.hardwareAcceleration) {
   // the Linux hardware video accel API (Mesa on AMD/Intel, proprietary
   // driver on Nvidia); VaapiIgnoreDriverChecks covers drivers Chromium
   // doesn't have on its own allowlist but that do work.
+  //
+  // AcceleratedVideoEncoder: Chromium renamed/added this as the real
+  // gate for hardware video ENCODE as of Chromium 131 -- VaapiVideoEncoder
+  // alone (this Electron's Chromium is 150) was confirmed live to NOT be
+  // enough on its own: with only VaapiVideoEncoder set, a real screen
+  // share fell back to software OpenH264 even though `ffmpeg -c:v
+  // h264_vaapi` confirmed the driver itself works and can hardware encode
+  // H264/HEVC on this exact GPU. Adding this flag was confirmed live to
+  // fix it: real outbound-rtp stats went from
+  // encoderImplementation:"OpenH264" to
+  // encoderImplementation:"VaapiVideoEncodeAccelerator",
+  // powerEfficientEncoder:true, and renderer CPU during an active share
+  // dropped from ~300% (software VP8) to ~160% (hardware H264) at the
+  // same 2560x1440 resolution.
   app.commandLine.appendSwitch(
     "enable-features",
-    "VaapiVideoEncoder,VaapiVideoDecoder,VaapiIgnoreDriverChecks",
+    "VaapiVideoEncoder,VaapiVideoDecoder,VaapiIgnoreDriverChecks,AcceleratedVideoEncoder",
   );
 }
 
