@@ -201,6 +201,22 @@ impl Drop for CaptureHandle {
     }
 }
 
+/// Requested capture quality, threaded down from the web app's own
+/// screen-share quality picker (`getEnabledScreenShareQualities()` in
+/// `for-web`'s `state.tsx`) via `getDisplayMedia`'s `constraints.video`
+/// -- previously this addon ignored that entirely and always used the
+/// hardcoded defaults below, so picking e.g. "1440p 60FPS" in the app's
+/// own UI had no effect on what this addon actually captured. Both
+/// fields optional: `None` falls back to the same default this addon
+/// always used (1920px longer side, 60fps) -- e.g. for the
+/// Chromium-fallback path's own constraints format not being present,
+/// or any caller that predates this option existing.
+#[napi(object)]
+pub struct CaptureOptions {
+    pub max_dimension: Option<u32>,
+    pub frame_rate: Option<u32>,
+}
+
 /// Starts a screen/window capture session. `on_ready` is called once,
 /// right after the portal negotiation succeeds and before any frames are
 /// delivered, with the source type (`"monitor"`/`"window"`/`"virtual"`,
@@ -217,13 +233,17 @@ pub fn start_capture(
     on_ready: ThreadsafeFunction<Option<String>, ErrorStrategy::CalleeHandled>,
     on_frame: ThreadsafeFunction<FrameData, ErrorStrategy::CalleeHandled>,
     on_error: ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>,
+    options: Option<CaptureOptions>,
 ) -> Result<CaptureHandle> {
     eprintln!("[stoat-capture-diag] start_capture() called, spawning capture thread");
+    let max_dimension = options.as_ref().and_then(|o| o.max_dimension).unwrap_or(1920);
+    let frame_rate = options.as_ref().and_then(|o| o.frame_rate).unwrap_or(60);
     let stop_flag = Arc::new(AtomicBool::new(false));
     let thread_stop_flag = stop_flag.clone();
 
     let join_handle = std::thread::spawn(move || {
-        if let Err(err) = run_capture(thread_stop_flag, on_ready, on_frame) {
+        if let Err(err) = run_capture(thread_stop_flag, on_ready, on_frame, max_dimension, frame_rate)
+        {
             on_error.call(Ok(err.to_string()), ThreadsafeFunctionCallMode::NonBlocking);
         }
         eprintln!("[stoat-capture-diag] capture thread function returned");
@@ -263,6 +283,8 @@ fn run_capture(
     stop_flag: Arc<AtomicBool>,
     on_ready: ThreadsafeFunction<Option<String>, ErrorStrategy::CalleeHandled>,
     on_frame: ThreadsafeFunction<FrameData, ErrorStrategy::CalleeHandled>,
+    max_dimension: u32,
+    frame_rate: u32,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let rt = RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio runtime init"));
     let (fd, node_id, source_type) = rt.block_on(negotiate_portal())?;
@@ -270,7 +292,7 @@ fn run_capture(
         Ok(source_type.map(str::to_string)),
         ThreadsafeFunctionCallMode::NonBlocking,
     );
-    capture_loop(fd, node_id, stop_flag, on_frame)
+    capture_loop(fd, node_id, stop_flag, on_frame, max_dimension, frame_rate)
 }
 
 /// The portal's screencast permission token, saved from one negotiation and
@@ -354,6 +376,8 @@ fn capture_loop(
     node_id: u32,
     stop_flag: Arc<AtomicBool>,
     on_frame: ThreadsafeFunction<FrameData, ErrorStrategy::CalleeHandled>,
+    max_dimension: u32,
+    frame_rate: u32,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     pw::init();
 
@@ -418,65 +442,20 @@ fn capture_loop(
     // below, so 10fps costs little real quality and further shrinks how
     // much can pile up in that pipeline before it's actually sent.
     //
-    // Raised back to 60fps (2026-08-21, new session): that 13-15fps
-    // drain ceiling and ~950kbps achieved bitrate were both measured
-    // against the old Oracle VPS relay -- SPIKE.md's "migrated off the
-    // VPS entirely" session update since routed media over this user's
-    // home connection directly (real public IP, TURN enabled) instead of
-    // through a low-bandwidth VPS tier + WireGuard tunnel hop, which is
-    // exactly what that ceiling was attributed to. Untested at this rate
-    // since that migration -- this is the requested 1440p60fps target,
-    // not yet confirmed against real stats. The existing protections
-    // (this interval, the JS-side `desiredSize <= 0` backpressure check,
-    // mimalloc, the zero-init-skipping downscale) all still apply
-    // unchanged; if RSS or CPU grows unbounded again during a live test,
-    // the real `[stoat-stats]` console output (screenShareAudio.ts) will
-    // show whether it's still a drain-rate mismatch (qualityLimitationReason,
-    // achieved bitrate vs target) or something new -- check that before
-    // just lowering this number again.
-    const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16); // ~60fps
-    // 1080p is the standard target for real-time video sharing -- well
-    // past what's needed to read shared content clearly, at a fraction of
-    // native monitor resolution's per-frame cost (2560x1440 -> 1920x1080
-    // here is already a ~44% byte reduction; a 4K monitor would see far
-    // more).
-    // Confirmed live via real WebRTC stats (RTCPeerConnection outbound-rtp
-    // reports) that LiveKit publishes screen-share with *simulcast* --
-    // two resolution layers (e.g. 1920x1080 and 960x540) encoded
-    // simultaneously, both stuck around 13-15fps even though this addon
-    // was delivering frames faster than that. Encoding two layers at once
-    // is real CPU/encoder work regardless of source resolution; 1280 (vs
-    // 1920) cuts the pixel count -- and so the combined cost of *both*
-    // simulcast layers derived from it -- by more than half.
-    // Lowered 1920 -> 1280 (1080p -> 720p) chasing the same 500MB RAM
-    // budget: this directly cuts per-frame byte volume (so every copy
-    // downstream -- the Rust-side downscale buffer, the postMessage
-    // transfer, VideoFrame construction, and whatever Chromium's own
-    // encode pipeline buffers internally) by more than half versus 1920,
-    // on top of the pixel-count-halves-both-simulcast-layers reasoning
-    // already noted below.
-    //
-    // Tried 2560 (1440p, full native res on this monitor) (2026-08-21,
-    // new session) -- reverted. This is exactly the combination item 6
-    // above already lived through once: "full native monitor res at
-    // 60-80fps reliably froze the whole Electron app", fixed *then* by
-    // downscaling to 1920. Live-confirmed again this session: at 2560 +
-    // 60fps, the renderer's main thread became fully unresponsive within
-    // ~10-15s of a share starting -- not just slow, but unresponsive to
-    // CDP's own Runtime.evaluate (a 5s round-trip that should be near-
-    // instant), meaning the freeze is real main-thread saturation from
-    // the sustained per-frame work (a ~14.75MB copy every 16ms at this
-    // size, downscale_packed_4bpp is a no-op at exactly 2560, then a
-    // VideoFrame construction + write() on the page's main thread for
-    // every one of those), not a network-side limit -- the VPS
-    // migration fixed a *different* bottleneck (encode/send throughput)
-    // and never made this one better. 1920 was the highest value the
-    // prior session actually confirmed working at 60fps; back to that
-    // until this JS-side per-frame cost itself is reduced (a real buffer
-    // pool instead of a fresh Vec every frame, or capping delivery below
-    // 60fps at this resolution) -- raise this again only after such a
-    // change, not before.
-    const MAX_FRAME_DIMENSION: u32 = 1920;
+    // Both now caller-supplied (`CaptureOptions`, from the web app's own
+    // screen-share quality picker via `getDisplayMedia`'s constraints --
+    // see `start_capture`'s doc comment) instead of hardcoded. Full
+    // history of why 1920/60fps became this addon's defaults, and the
+    // live-confirmed freeze at 2560x1440@60fps (real main-thread
+    // saturation from per-frame VideoFrame construction cost, NOT a
+    // network or encode-side limit -- isolated via a minimal addon-only
+    // repro with zero JS pipeline, which had no issue at the same rate)
+    // is in SPIKE.md, not repeated here now that it's no longer a fixed
+    // constant. Callers requesting resolutions above 1920 (e.g. the
+    // "ultra" 1440p60fps quality) are knowingly re-entering that
+    // previously-froze territory -- worth a fresh live test with real
+    // RSS/CPU numbers before trusting it, same as any other value here.
+    let min_frame_interval = std::time::Duration::from_millis(1000 / frame_rate.max(1) as u64);
     let last_frame_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
 
     let _listener = stream
@@ -500,7 +479,7 @@ fn capture_loop(
             {
                 let mut last = last_frame_at.lock().unwrap();
                 if let Some(prev) = *last {
-                    if now.duration_since(prev) < MIN_FRAME_INTERVAL {
+                    if now.duration_since(prev) < min_frame_interval {
                         return;
                     }
                 }
@@ -543,7 +522,7 @@ fn capture_loop(
                     info.size().width,
                     info.size().height,
                     src_stride,
-                    MAX_FRAME_DIMENSION,
+                    max_dimension,
                 )
             } else {
                 (bytes.to_vec(), info.size().width, info.size().height, src_stride)

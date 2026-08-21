@@ -1,5 +1,107 @@
 # Rust-owned screen capture -- spike notes
 
+## Session update (2026-08-21, fourth session): resolution/fps now wired
+## end-to-end from the web app's quality picker; simulcast disabled;
+## no hardware encode available on this GPU for any codec
+
+### The web UI's quality picker never actually controlled this addon
+
+Confirmed by reading this addon's own code alongside `for-web`'s
+`state.tsx`: `getDisplayMedia`'s `constraints.video` (built by
+`livekit-client` from whatever quality the user picked --
+`{width:{ideal:N}, height:{ideal:N}, frameRate:N}`, confirmed against
+`screenCaptureToDisplayMediaStreamOptions` in `livekit-client`'s own
+source) was never read on the Rust-capture path -- `startRustCapture()`
+just always negotiated a capture at this addon's own hardcoded
+`MAX_FRAME_DIMENSION`/`MIN_FRAME_INTERVAL`. Picking a higher quality in
+the app's own UI had **zero effect** for any user on this capture path
+(Wayland with the addon available) -- only the Chromium-fallback path
+(addon unavailable, or non-Wayland platforms where this addon doesn't
+apply) ever actually honored it, since Chromium's own real
+`getDisplayMedia` reads those constraints itself.
+
+**Fixed**: `start_capture` (`src/lib.rs`) now takes an optional
+`CaptureOptions { max_dimension, frame_rate }`, threaded through
+`run_capture`/`capture_loop`, replacing the two hardcoded consts
+(`MAX_FRAME_DIMENSION`, `MIN_FRAME_INTERVAL`) -- falls back to the same
+1920px/60fps default when omitted. `screenShareCapture.ts`'s `start()`
+takes a matching `options` param and passes it straight through.
+`screenShareAudio.ts` adds `captureOptionsFromConstraints()`, extracting
+width/height/frameRate from whatever `getDisplayMedia` constraints the
+web app actually asked for, called at the one place `startRustCapture()`
+negotiates a fresh capture.
+
+### No hardware video encode on this GPU, for any codec
+
+Probed directly via `ffmpeg`'s VA-API encoders against
+`/dev/dri/renderD128` (h264_vaapi, hevc_vaapi, vp8_vaapi, vp9_vaapi) --
+every single one failed with "No usable encoding profile/entrypoint
+found". This GPU's VA-API driver is decode-only; there is no
+hardware-encodable codec to switch to as an alternative to the software
+VP8 simulcast encode already noted below. This rules out "pick a
+hardware-encodable codec" as a lever entirely -- it isn't a Chromium
+config problem, it's the actual silicon.
+
+### Simulcast disabled for screen share (in the for-web fork, not this repo)
+
+`for-web`'s `state.tsx` called `setScreenShareEnabled(true, options)`
+with no third `publishOptions` argument at all, so `livekit-client`'s
+default (`simulcast: true`, publishing up to three encoded layers
+simultaneously -- two observed live earlier this session, e.g. 1080p +
+540p) applied unconditionally. Each extra layer is a full additional
+software encode pass with no hardware acceleration available (see
+above) -- changed to `{ simulcast: false }`, one real layer at whatever
+resolution/fps the user picked, no throwaway smaller layers nobody may
+even be viewing. This change lives in a local clone of
+`stoatchat/for-web` (public GitHub repo), not in this repository --
+`for-web` runs from a prebuilt image on the server
+(`ghcr.io/stoatchat/for-web:0c31cf0`, `/srv/stoat/compose.yml`), so
+shipping this needs a custom-built image (mirroring
+`/srv/stoat/Dockerfile.caddy`'s existing multi-stage-build pattern) and
+a `compose.yml` change to build from it instead of pulling upstream --
+not yet done as of this writing.
+
+### New "ultra" (1440p60fps) quality tier -- also in the for-web fork
+
+`state.tsx`'s `getEnabledScreenShareQualities()` only ever offered
+"low" (720p30), "high" (1080p30, gated on the server's
+`video_resolution` limit being >= 1920x1080), and "text" (source
+res @5fps). The server this app is deployed against
+(`root@192.168.20.189`, `/srv/stoat/Revolt.toml`) already has
+`video_resolution = [2560, 1440]` and `video_frame_rate = 60` configured
+-- the server was never the blocker, the client's quality list simply
+never had a tier above 1080p30 to offer regardless of what the server
+allowed. Added `qualities.ultra` (2560x1440@60fps), gated on the same
+limit being >= 2560x1440, so a server configured for less doesn't
+advertise a quality it can't actually deliver.
+
+**Considered and deliberately NOT done: a Rust-side buffer pool.**
+Re-examined the "deliberately not done" note from an earlier session
+suggesting this as the fix for 2560x1440@60fps's live-confirmed freeze.
+On reflection this session: that freeze was isolated, in an even
+earlier session, via a minimal addon-only repro with *no* JS pipeline
+at all handling the same frame rate/resolution with zero issue --
+meaning the bottleneck is JS-main-thread work (VideoFrame construction,
+the generator's `write()`) that happens *after* a frame already has a
+buffer, not the cost of allocating that buffer in Rust in the first
+place (which mimalloc, added an earlier session, already mitigates the
+real cost of -- allocator page-return behavior, not the copy itself). A
+buffer pool cannot reduce a JS-main-thread bottleneck it never touches.
+Reused buffers would still need a full fresh copy out of PipeWire's own
+buffer either way (its lifetime is tied to the stream, can't be handed
+to JS directly), so the memcpy cost -- the more likely real contributor
+at 2560x1440's ~14.75MB/frame -- isn't avoided either. Not pursued
+further without evidence it's actually the bottleneck at these settings
+(unmeasured: whether Rust-side allocation/copy or JS-side VideoFrame
+construction dominates at 2560x1440@60fps specifically -- worth
+profiling for real before building this, not assuming).
+
+**Not yet live-tested**: the resolution/fps wiring itself (with the
+existing, unmodified for-web deployment, which still only offers up to
+1080p30 -- so this needs at minimum a same-values-as-before smoke test
+to confirm no regression), and the "ultra" tier + simulcast:false
+combination (needs the for-web fork actually built and deployed first).
+
 ## Session update (2026-08-21, third session): the REAL "share twice" bug
 ## found and fixed -- a per-capture Tokio runtime orphaning ashpd's cached
 ## D-Bus connection

@@ -48,11 +48,17 @@ interface NativeCaptureHandle {
   stop(): void;
 }
 
+interface NativeCaptureOptions {
+  maxDimension?: number;
+  frameRate?: number;
+}
+
 interface ScreenCaptureAddon {
   startCapture(
     onReady: (err: Error | null, sourceType: string | null) => void,
     onFrame: (err: Error | null, frame: NativeFrame) => void,
     onError: (err: Error | null, message: string) => void,
+    options?: NativeCaptureOptions,
   ): NativeCaptureHandle;
 }
 
@@ -129,9 +135,16 @@ contextBridge.exposeInMainWorld("nativeScreenCapture", {
   // (see above), transferred rather than cloned. onReady/onError stay on
   // the contextBridge proxy since they're small, infrequent, and don't
   // need transfer semantics.
+  //
+  // `options` (maxDimension/frameRate) is threaded straight through to
+  // the addon's own `CaptureOptions` -- previously this addon ignored
+  // whatever resolution/fps the web app's own screen-share quality
+  // picker requested and always used its own hardcoded default, so
+  // picking a higher quality in that UI had no effect here at all.
   start(
     onReady: (sourceType: string | null) => void,
     onError: (message: string) => void,
+    options?: { maxDimension?: number; frameRate?: number },
   ): Promise<number | null> {
     return loaded.then(() => {
       if (!addon) return null;
@@ -152,6 +165,9 @@ contextBridge.exposeInMainWorld("nativeScreenCapture", {
           framePort.postMessage(frame, [frame.data.buffer]);
         },
         (_err, message) => onError(message),
+        options
+          ? { maxDimension: options.maxDimension, frameRate: options.frameRate }
+          : undefined,
       );
       handles.set(id, handle);
       return id;

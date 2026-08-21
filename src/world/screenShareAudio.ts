@@ -482,7 +482,35 @@ function buildPatchScript(isWayland: boolean) {
   // signalling the caller to fall back to Chromium's own (leakier, but
   // working) capture -- a screen share should never just break because
   // this addon isn't built for this platform/arch yet.
-  async function startRustCapture() {
+  // livekit-client builds getDisplayMedia's video constraints from the
+  // web app's own quality picker (state.tsx's getEnabledScreenShareQualities())
+  // as { width: {ideal: N}, height: {ideal: N}, frameRate: N } (confirmed
+  // against livekit-client's own screenCaptureToDisplayMediaStreamOptions
+  // source) -- this addon previously never looked at any of that and
+  // always captured at its own hardcoded default, so picking a higher
+  // quality in the app's UI silently had no effect on the Rust-capture
+  // path (only the Chromium-fallback path, whose real getDisplayMedia
+  // actually honors these constraints itself, ever responded to it).
+  function captureOptionsFromConstraints(
+    constraints,
+  ) {
+    const video = constraints && constraints.video;
+    if (!video || typeof video !== "object") return undefined;
+    const dim = (v) =>
+      typeof v === "number" ? v : (v && (v.ideal ?? v.exact ?? v.max)) || undefined;
+    const width = dim(video.width);
+    const height = dim(video.height);
+    const frameRate =
+      typeof video.frameRate === "number"
+        ? video.frameRate
+        : (video.frameRate && (video.frameRate.ideal ?? video.frameRate.exact ?? video.frameRate.max)) ||
+          undefined;
+    const maxDimension = width && height ? Math.max(width, height) : undefined;
+    if (maxDimension == null && frameRate == null) return undefined;
+    return { maxDimension, frameRate };
+  }
+
+  async function startRustCapture(constraints) {
     if (!window.nativeScreenCapture) return null;
     if (!(await window.nativeScreenCapture.isAvailable())) return null;
     await framePortReady;
@@ -531,6 +559,7 @@ function buildPatchScript(isWayland: boolean) {
               realVideoTrack.stop();
             }
           },
+          captureOptionsFromConstraints(constraints),
         )
         .then((handleId) => {
           if (handleId == null) {
@@ -585,7 +614,7 @@ function buildPatchScript(isWayland: boolean) {
       // here (not the clone), see its own comment above.
       stream = new MediaStream([realVideoTrack.clone()]);
     } else {
-      const rustCapture = IS_WAYLAND ? await startRustCapture() : null;
+      const rustCapture = IS_WAYLAND ? await startRustCapture(constraints) : null;
       usingRustCapture = !!rustCapture;
       if (rustCapture) {
         stream = new MediaStream([createRustVideoTrack()]);
