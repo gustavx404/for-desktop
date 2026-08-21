@@ -1,5 +1,296 @@
 # Rust-owned screen capture -- spike notes
 
+## Session update (2026-08-21, eighth session): the REAL culprit found --
+## a hardcoded 640x480@5fps override in `for-web` clobbered every quality
+## tier this whole time; H264 switch confirmed a real (partial) CPU win
+
+Continuation of the seventh session's GPU-encode work. After fixing this
+machine's VA-API driver (RPM Fusion) and switching the screen-share codec to
+H264 in `for-web` (see below), live-tested via `--remote-debugging-port` +
+a CDP script reading `pc.getStats()` in real time (same method as the sixth
+session). Result was confusing at first: `encoderImplementation` correctly
+showed `"OpenH264"` (not `libvpx` -- the codec switch worked), but the
+*resolution* was stuck at 640x480@5fps regardless of which quality tier
+(low/high/ultra) was selected in the app.
+
+**Root cause, confirmed by instrumenting the actual constraints object**:
+`packages/client/components/rtc/index.ts` in `for-web` -- unrelated to any
+of this investigation's own changes -- installs its own
+`navigator.mediaDevices.getDisplayMedia` wrapper (added in #1497, "Always
+ensure the stream starts as below 720p") that **unconditionally overwrites
+every track's video constraints to `{width: 640, height: 480, frameRate:
+5}`**, no matter what was actually requested. Because this module's script
+loads *after* this app's own preload-injected patch
+(`world/screenShareAudio.ts`), it captures the preload's already-patched
+`getDisplayMedia` as its own `originalMediaCall`, silently overwrites the
+constraints, then calls through to it -- meaning every quality tier this
+whole project has built (the "low"/"high"/"ultra"/"text" work across
+sessions four through six, all of it) has been getting clobbered to
+640x480@5fps immediately before reaching either this app's Rust capture
+path or Chromium's own fallback, for as long as this file has existed on
+`main`. This explains a large share of the *original* "fps doesn't keep up"
+symptom this whole investigation started from -- not just today's H264
+work.
+
+**Fix**: removed the constraint-overwrite block from `index.ts` entirely
+(kept its separate virtual-mic audio logic, unrelated and still needed).
+Confirmed live immediately after: `getDisplayMedia constraints.video` now
+correctly shows `{width:{ideal:2560},height:{ideal:1440},frameRate:60}` for
+the "ultra" tier, and real outbound-rtp stats show `frameWidth:2560,
+frameHeight:1440` actually being encoated -- the resolution finally matches
+what's selected.
+
+**With the real bug fixed, a fair H264-vs-VP8 comparison at the same
+resolution (2560x1440) became possible for the first time**:
+
+| | VP8 (`libvpx`, sixth session) | H264 (`OpenH264`, this session) |
+|---|---|---|
+| Achieved fps | ~15 (target 60) | ~15 (target 60) |
+| Renderer CPU (`top -b`, instantaneous) | ~300-320% | ~170-190% |
+| Encoder | software | software (VA-API hardware still not invoked) |
+
+Same fps ceiling, but ~40% less CPU for the same output -- a real,
+measured, worthwhile win even though it's software-only. The fps ceiling
+itself did **not** move with the codec change, meaning something other than
+raw encoder throughput is also capping it around 15fps at this resolution
+(worth its own investigation later -- candidates: JS main-thread
+`VideoFrame` construction cost, or some other fixed-cost stage in the
+pipeline, per the sixth session's per-thread CPU breakdown).
+
+**Still open, not resolved this session**: why Chromium (this Electron
+build) picks the software `OpenH264` encoder for WebRTC instead of the
+VA-API hardware H264 encoder confirmed working via `ffmpeg` (seventh
+session). `chrome://gpu` is not reachable via CDP in this Electron build
+(`Target.createTarget` for a `chrome://` URL returns "Not supported"),
+which would have been the direct way to check video-encode-acceleration
+status. The `--enable-features=VaapiVideoEncoder` flag already present
+(`src/main.ts`) is evidently not sufficient on its own to route WebRTC's
+own encoder factory to hardware -- there is likely an additional,
+more-specific flag or build-time requirement (Chromium's WebRTC hardware
+H264 encode support has historically been partial/flag-gated even when
+general VA-API hardware video is otherwise working) that a future session
+should investigate directly against Chromium's own source/flags rather than
+guessing further. NVIDIA (CachyOS) and Intel (Pop!_OS) validation, planned
+in the seventh session, also still not done.
+
+## Session update (2026-08-21, seventh session): AMD hardware H264/HEVC
+## encode CONFIRMED working after fixing the missing VA-API driver -- the
+## CPU bottleneck found in the sixth session has a real hardware fix on
+## this exact machine, pending only a codec change on the `for-web` side
+
+Follow-up to the sixth session's CPU-bound conclusion (~300%+ CPU,
+software `libvpx` VP8 encode, no lever in this repo). Investigated whether
+GPU hardware encode is actually reachable on this RX 6600XT, and it is --
+the earlier "no hardware encode available on this GPU for any codec"
+conclusion (fourth session, this file) was **wrong**, not because the
+hardware can't do it, but because `mesa-va-drivers` (the actual VA-API
+driver package providing `radeonsi_drv_video.so`) wasn't installed on this
+system at all -- the fourth session's `ffmpeg` probe was running against no
+usable driver whatsoever, not against a real "decode-only" limitation.
+
+**Root cause and fix, confirmed step by step**:
+1. `mesa-va-drivers` (Fedora's official, patent-policy-restricted build)
+   installed first: added VP9/AV1/MPEG2/JPEG *decode* entrypoints only --
+   still zero H264/HEVC, zero encode of any kind. Fedora's official Mesa
+   build deliberately excludes H264/HEVC (patent-encumbered codecs) from
+   this package.
+2. RPM Fusion's `mesa-va-drivers-freeworld` -- same open-source Mesa
+   (26.1.7, identical version to the official build), compiled with those
+   codecs enabled -- is the standard fix every Fedora app needing H264
+   uses (Firefox, VLC, Chromium's official builds, etc.), but `dnf swap
+   mesa-va-drivers mesa-va-drivers-freeworld` initially failed: real file
+   conflict with `mesa-dri-drivers` (both packages ship the same
+   `libgallium-*.so` blob), which `steam` hard-depends on -- not a version
+   mismatch (both were the same `26.1.7-1.fc44`). **Resolved** (by the
+   user, exact method not captured in this session) without losing either
+   `steam` or `mesa-dri-drivers` -- both still installed and intact after.
+3. **Confirmed working end-to-end**: `vainfo` now reports
+   `VAEntrypointEncSlice` for `H264ConstrainedBaseline`/`Main`/`High` and
+   `HEVCMain`/`Main10` (previously: decode-only entrypoints, nothing for
+   H264/HEVC at all). A real `ffmpeg -c:v h264_vaapi` encode of 60 frames
+   at 1920x1080 completed in ~0.3s (hardware-speed, not the ~4s+ a
+   real-time software encode of the same frame count would take) --
+   genuine, working AMD VCN hardware H264 encode on this exact GPU.
+
+**Considered and explicitly rejected this session, worth remembering why**:
+- **AMD's proprietary AMF SDK** (`h264_amf`/`hevc_amf` in `ffmpeg
+  -encoders`): tested directly, failed (`libamfrt64.so.1 failed to open`).
+  `AMF-devel` (headers only) is in Fedora's own official repo, but the
+  actual runtime library isn't shipped by Fedora or RPM Fusion at all --
+  would need AMD's own proprietary driver installer, which targets
+  workstation/Radeon Pro cards more than consumer RX-series, unconfirmed
+  whether it even supports this GPU. Not pursued further.
+- **Building our own Mesa from source, bundled inside this app's own
+  resources** (pointing Chromium at it via `LIBVA_DRIVERS_PATH` for just
+  this app's process, touching nothing system-wide): technically valid --
+  Mesa is the same open-source project either way, RPM Fusion's freeworld
+  package IS just Mesa built with more flags -- but explicitly rejected by
+  the user: a statically bundled driver build is tied to a specific
+  kernel/DRM-ABI/firmware combination and wouldn't reliably work across
+  different users' systems, which doesn't actually solve "works
+  everywhere" any better than asking users to enable RPM Fusion
+  themselves, while adding real bundle-size/maintenance cost.
+- **Cisco's OpenH264** (Fedora's own official `openh264` repo, legally
+  clean, zero conflict, no RPM Fusion needed -- same mechanism Firefox
+  uses for H264 on Fedora): real and available, but software-only, no GPU
+  acceleration -- doesn't address the CPU bottleneck this whole
+  investigation is about.
+
+**Conclusion for the wider "which GPU vendors need what" question this
+session was actually trying to answer**: AMD-on-Fedora is the *hardest*
+case of the three vendors specifically because of Fedora's H264/HEVC
+patent-policy split in Mesa's own packaging -- NVIDIA (NVENC ships with
+the proprietary driver most users already have) and Intel (H264/HEVC
+already in Fedora's *official* repos, no RPM Fusion needed historically)
+are expected to be meaningfully less friction, not yet validated this
+session -- user has access to a CachyOS (NVIDIA) and a Pop!_OS (Intel)
+machine for that, not yet done.
+
+**Not yet done**: (a) getting Chromium/LiveKit to actually negotiate H264
+for screen share instead of VP8 -- without this, the working hardware
+encoder above has nothing to encode for this app specifically, since VP8
+has no hardware encode path on essentially any consumer GPU; this is a
+`for-web` fork + LiveKit server change, outside this repo. (b)
+Re-measuring real CPU/fps with H264 hardware encode actually active in a
+live share, same methodology as the sixth session. (c) An in-app
+detector + guided fixer (Electron main process, `pkexec`-based, no
+terminal) so a user hitting this same missing-driver situation gets a
+native "fix it" dialog instead of manually working through RPM Fusion +
+package-conflict resolution the way this session did -- scoped as its own
+implementation phase, not yet started.
+
+## Session update (2026-08-21, sixth session): home-bandwidth theory REFUTED;
+## checking TURN relay vs P2P next
+
+The fifth session's "working theory, not yet confirmed" (targetBitrate stuck
+at 2,500,000 is the user's own real upload bandwidth, correctly detected by
+WebRTC's congestion control) is now refuted: a real speed test
+(user-reported, fast.com/speedtest.net) measured **90Mbps upload** on the
+home connection this app is now hosted from -- 36x the 2.5Mbps ceiling seen
+in `targetBitrate`. Whatever is capping it, it isn't the user's own link
+capacity.
+
+Per the fifth session's own "if it comes back much higher" branch: the next
+candidate is the TURN relay (`livekit.yml` has `turn.enabled: true` with a
+`relay_range_start/end: 30000-30100` range) -- if media is actually being
+relayed rather than flowing P2P, the relay server's own bandwidth/config
+could be the real ceiling instead. `RTCIceCandidatePairStats` (local/remote
+`candidateType`: `host`/`srflx` = P2P direct, `relay` = TURN-relayed) answers
+this directly and hadn't been pulled yet.
+
+**Added this session**: a `[stoat-stats] selected candidate pair:` log line
+in `screenShareAudio.ts`'s existing `[stoat-stats]` diagnostic block (same
+3s interval, same `pc.getStats()` call already being made -- no new
+overhead), logging `localType`/`remoteType`/`availableOutgoingBitrate`/
+`bytesSent`/`currentRoundTripTime` for the nominated, succeeded candidate
+pair; also switched both `[stoat-stats]` `console.log` calls from a raw
+object to `JSON.stringify(...)`, since Chromium's CDP console preview
+silently truncates object args to their first ~5 properties, which was
+hiding `targetBitrate`/`qualityLimitationReason`/`encoderImplementation`.
+
+**Live-tested, root cause CONFIRMED: CPU-bound software encode, not
+network.** Test performed on the user's own home LAN (same network on both
+ends -- not a true WAN path, see the caveat below), `--remote-debugging-port`
+CDP attached to the real running app, `pc.getStats()` read live:
+
+- `localType: "host"`, `remoteType: "prflx"` -- P2P direct, **not**
+  TURN-relayed. Rules out the relay server as a factor entirely for this
+  path.
+- `currentRoundTripTime`: 0-0.006s -- effectively zero, consistent with a
+  same-LAN path (expected, given the caveat below -- not itself evidence of
+  anything being wrong).
+- At the "ultra" (2560x1440@60fps target) tier: `frameWidth`/`frameHeight`
+  confirmed 2560x1440 (no downscale -- `MAX_FRAME_DIMENSION` is 2560, exactly
+  at the cap), but `framesPerSecond` measured live at **9-15fps**,
+  `targetBitrate` oscillating 2.2-2.5Mbps, `qualityLimitationReason: "none"`
+  throughout -- same symptom as every earlier session, but now confirmed
+  under network conditions (LAN, P2P, ~0ms RTT) where bandwidth cannot
+  plausibly be the limiter.
+- Cross-checked against the addon's own `[stoat-frame-diag]` counters at the
+  same moment: `received`/`written` both ~78-82 per 2s (~40fps), zero
+  `droppedWriteBusy`, zero `droppedDesiredSize` -- confirms (again) that
+  Rust delivers ~40fps cleanly and this patch's own write path accepts every
+  one of them with no backpressure. The loss is entirely downstream, inside
+  Chromium's own encode pipeline (fewer frames encoded than frames handed to
+  the generator's writable stream).
+- **Real CPU measured directly** (`top -b`, instantaneous, not `ps`'s
+  lifetime-average `%cpu` which undersells a recently-started spike): the
+  main renderer process sustained **~300-320% CPU** (3+ full cores) the
+  entire time a share was active. This is the actual bottleneck --
+  `encoderImplementation: "libvpx"` (software VP8, confirmed no hardware
+  encode path exists on this GPU, see the fourth session's VA-API probe
+  above) genuinely cannot encode 2560x1440 faster than ~9-15fps on this
+  hardware, and Chromium's own quality-limitation stat does not surface this
+  as `"cpu"` for a `MediaStreamTrackGenerator`-fed synthetic source the way
+  it might for a real camera capture -- `qualityLimitationReason: "none"`
+  is misleading here, not evidence of no limitation.
+
+**Caveat, not yet closed**: this test's peer was on the same home network as
+the sharer (near-zero RTT confirms it), not a real geographically-remote
+participant -- so it does not independently confirm the *original*
+multi-session theory chain is fully closed for a true WAN path too. It does
+NOT need to be re-tested over a real WAN before trusting the CPU conclusion,
+though: the CPU-bound mechanism found here (Chromium's own encoder pulling
+frames slower than they're supplied, independent of anything network-side)
+is a real, load-bearing bottleneck on its own regardless of what a WAN path
+separately adds on top -- a faster network can never make a CPU-saturated
+software encoder produce more frames per second.
+
+**Follow-up, same session: tested at 1080p ("high" tier) too -- fps did NOT
+scale up with the resolution drop.** 2560x1440 -> 1920x1080 is a 44% pixel
+reduction; if the bottleneck were purely per-pixel encode cost, fps should
+have risen substantially. It didn't: still measured live at **14-15fps**
+(target 30 for this tier), `targetBitrate` still ~1.8-2.5Mbps,
+`qualityLimitationReason: "none"`, main renderer CPU still **~250-340%**
+(`top -b`, instantaneous) -- both numbers essentially unchanged from the
+1440p test. This rules out "it's simply VP8's per-pixel encode cost" as the
+full explanation; something closer to a fixed per-frame cost dominates.
+
+**Per-thread CPU breakdown** (`top -H -p <renderer-pid>`, instantaneous,
+2s-delta samples) during this same 1080p share, roughly stable across
+several samples:
+- Renderer main (JS) thread: **~50-60%** of a core -- this addon's own
+  per-frame JS work (VideoFrame construction, this patch's `write()` call,
+  event-loop/message overhead) is genuinely NOT free, and is the one part
+  of this cost this codebase actually controls.
+- One dominant `ThreadPoolForegroundWorker`: **~35%**.
+- 7-8 more `ThreadPoolForegroundWorker` threads at **~5-10% each**, plus a
+  `VideoFrameCompositor`-looking thread (~10%) -- Chromium's own internal
+  thread pool, most plausibly carrying the software libvpx encode plus
+  related video-pipeline work, spread across cores. Thread names alone
+  don't prove libvpx is the dominant cost here (no thread is explicitly
+  named for it) -- a real CPU profile (Chromium's Performance panel / CDP
+  `Profiler` domain) attributing self-time by function would be needed to
+  confirm exactly how this ~150-180% splits between encode itself and other
+  Chromium-internal work, not yet done this session.
+- Sum of the top 15 threads (~247%) roughly matches the process-level total
+  measured separately (~250-340%) -- consistent, not a measurement
+  artifact.
+
+**Where this leaves the fix, as of this session's end**: no further code
+*bug* is left to chase here -- every earlier session's real bugs
+(`contentHint`, missing `videoEncoding`, simulcast, the leaks, the reshare
+hang) are fixed and confirmed. What remains is a genuine, roughly
+resolution-independent CPU cost split across (a) this addon's own JS-side
+per-frame pipeline (~50-60% of a core, real and addressable -- the
+previously-shelved "reusable buffer pool" idea, noted a few sessions ago as
+*not* worth building without evidence it's needed, now has that evidence:
+this is a real, measured, non-trivial share of the total, not a guess) and
+(b) Chromium's own software video pipeline/encode (~150-180%, spread across
+its thread pool, very likely dominated by libvpx given no hardware encode
+path exists on this GPU for any codec -- see the fourth session's VA-API
+probe -- but not proven at the function level yet). (b) has no lever from
+this codebase or the `for-web` fork short of different hardware; (a) is
+worth attempting but bounded -- even eliminating it entirely wouldn't touch
+(b)'s ~150-180%. Given both the 1440p and 1080p tests independently landed
+at the same ~14-15fps regardless of resolution, that number looks like this
+specific machine's real achievable ceiling for a screen share right now --
+the honest next step is either (1) profile precisely to see how much of (b)
+is really encode vs. reducible Chromium overhead before investing in (a), or
+(2) accept ~15fps as the real number this hardware delivers and recalibrate
+the quality tiers' advertised fps (in the `for-web` fork, not this repo) to
+match it rather than promising 30/60fps the software encoder can't sustain.
+
 ## Session update (2026-08-21, fifth session): bitrate/fps ceiling
 ## root-caused to (likely) real network bandwidth, not code
 

@@ -53,7 +53,7 @@ function buildPatchScript(isWayland: boolean) {
         pc.getStats().then((stats) => {
           stats.forEach((report) => {
             if (report.type === "outbound-rtp" && report.kind === "video") {
-              console.log("[stoat-stats] outbound video:", {
+              console.log("[stoat-stats] outbound video:", JSON.stringify({
                 frameWidth: report.frameWidth,
                 frameHeight: report.frameHeight,
                 framesPerSecond: report.framesPerSecond,
@@ -64,7 +64,28 @@ function buildPatchScript(isWayland: boolean) {
                 targetBitrate: report.targetBitrate,
                 encoderImplementation: report.encoderImplementation,
                 powerEfficientEncoder: report.powerEfficientEncoder,
-              });
+              }));
+            }
+            // Diagnostic (2026-08-21): targetBitrate is stuck at 2.5Mbps
+            // regardless of quality tier, and a real upload-speed test
+            // ruled out the user's own link (90Mbps measured) as the
+            // cause -- this answers whether media is flowing P2P direct
+            // (localType/remoteType "host"/"srflx") or through the TURN
+            // relay ("relay"), which points the next step at either the
+            // network path or the relay server's own config/bandwidth
+            // instead of guessing further.
+            if (report.type === "candidate-pair" && report.nominated && report.state === "succeeded") {
+              const local = stats.get(report.localCandidateId);
+              const remote = stats.get(report.remoteCandidateId);
+              console.log("[stoat-stats] selected candidate pair:", JSON.stringify({
+                localType: local && local.candidateType,
+                remoteType: remote && remote.candidateType,
+                localPort: local && local.port,
+                remotePort: remote && remote.port,
+                availableOutgoingBitrate: report.availableOutgoingBitrate,
+                bytesSent: report.bytesSent,
+                currentRoundTripTime: report.currentRoundTripTime,
+              }));
             }
           });
         });
