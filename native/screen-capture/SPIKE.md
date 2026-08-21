@@ -220,10 +220,38 @@ provides. Real users in the same test session (2 remote participants)
 did confirm the share was visible and working, with good resolution and
 bitrate improving substantially once motion stopped -- consistent with
 the fixes above actually working end-to-end; the frozen-PC observation is
-most likely a diagnostic-tooling limitation, not a shipped regression, but
-flagged here for a future session to confirm with better instrumentation
-(e.g. tagging each PC by its actual role at creation time) before fully
-closing this out.
+most likely a diagnostic-tooling limitation, not a shipped regression.
+
+**Resolved, same day**: confirmed via role-tagging exactly as flagged
+above. `StoatRTCPeerConnection` (`screenShareAudio.ts`) now tags each PC
+with `__stoatIndex` (creation order) and a live role guess (does it
+currently have an active outbound video `RTCRtpSender.track`) --
+livekit-client's `PCTransportManager` always creates the publisher PC
+first, subscriber immediately after, confirmed by reading its source
+directly. With this tag in place, the PC actually carrying an active
+video sender showed `framesSent` climbing normally the entire test
+(65 -> 123 -> 200 -> 266 -> 353 over ~18s, no freeze) while a separate,
+no-video-sender PC (the subscriber, correctly receiving the other
+participants) was what earlier untagged tests happened to be reading
+by fixed array index -- confirming this was a diagnostic-script bug
+(reading `window.__stoatPCs` by a fixed position that didn't reliably
+mean the same PC across test runs), not a real app bug. Resolution
+swinging noticeably during that same window (640x360 -> 320x180 ->
+480x270 -> 640x360) tracked `availableOutgoingBitrate` swinging just as
+much (300kbps to 5.4Mbps) -- expected `degradationPreference:
+"maintain-framerate"` behavior on a real, non-steady network path, not a
+new problem.
+
+**Where this leaves the whole investigation**: every fix in this and the
+two prior sessions (640x480 cap removed, `AcceleratedVideoEncoder`,
+`screenShareEncoding`, `degradationPreference`, the Rust interval margin,
+the mid-share sender.setParameters()+race fix) is now live-confirmed
+working, including under real multi-participant production conditions.
+Remaining open items are the ones already tracked: NVIDIA/Intel
+validation, an in-app RPM-Fusion guided fixer, a visible hardware-accel
+toggle in `for-web`'s settings UI, and profiling exactly how much closer
+to 60fps is reachable by further reducing this addon's own per-frame
+JS/Rust overhead now that encode itself is no longer the bottleneck.
 
 ## Session update (2026-08-21, seventh session): AMD hardware H264/HEVC
 ## encode CONFIRMED working after fixing the missing VA-API driver -- the

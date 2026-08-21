@@ -42,18 +42,38 @@ function buildPatchScript(isWayland: boolean) {
   if (window.RTCPeerConnection && !window.RTCPeerConnection.__stoatStatsPatched) {
     const OriginalRTCPeerConnection = window.RTCPeerConnection;
     window.__stoatPCs = [];
+    let stoatPcCounter = 0;
     function StoatRTCPeerConnection(...args) {
       const pc = new OriginalRTCPeerConnection(...args);
+      // Diagnostic (2026-08-21): livekit-client's PCTransportManager
+      // always creates exactly one "publisher" PC first, then one
+      // "subscriber" PC immediately after (PCTransportManager.ts's own
+      // constructor) -- multiple sessions of this app showed 3 PCs total
+      // with one appearing "stuck" (framesSent frozen shortly after
+      // starting a share), suspected to be a disposable "provisional
+      // round" but never confirmed. __stoatIndex (creation order) plus a
+      // live role guess (does this PC actually have an active outbound
+      // video sender right now, independent of getStats() polling)
+      // answers directly whether the stuck PC is really the live
+      // publisher (a real problem) or a leftover round (expected/benign).
+      pc.__stoatIndex = stoatPcCounter++;
       window.__stoatPCs.push(pc);
       const interval = setInterval(() => {
         if (pc.connectionState === "closed") {
           clearInterval(interval);
           return;
         }
+        const videoSenders = pc.getSenders().filter(
+          (s) => s.track && s.track.kind === "video",
+        );
+        const role = videoSenders.length > 0 ? "has-active-video-sender" : "no-video-sender";
         pc.getStats().then((stats) => {
           stats.forEach((report) => {
             if (report.type === "outbound-rtp" && report.kind === "video") {
               console.log("[stoat-stats] outbound video:", JSON.stringify({
+                pcIndex: pc.__stoatIndex,
+                pcRole: role,
+                pcSignalingState: pc.signalingState,
                 frameWidth: report.frameWidth,
                 frameHeight: report.frameHeight,
                 framesPerSecond: report.framesPerSecond,
@@ -78,6 +98,8 @@ function buildPatchScript(isWayland: boolean) {
               const local = stats.get(report.localCandidateId);
               const remote = stats.get(report.remoteCandidateId);
               console.log("[stoat-stats] selected candidate pair:", JSON.stringify({
+                pcIndex: pc.__stoatIndex,
+                pcRole: role,
                 localType: local && local.candidateType,
                 remoteType: remote && remote.candidateType,
                 localPort: local && local.port,
