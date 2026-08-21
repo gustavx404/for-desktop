@@ -183,77 +183,95 @@ function buildPatchScript(isWayland: boolean) {
   let lastCaptureStartedAt = 0;
   const REUSE_WINDOW_MS = 10000;
 
-  // The real, definitive signal that the user stopped sharing: confirmed
-  // live that our own track's 'ended' event and writable-stream failures
-  // (both tried above/below) don't reliably fire when LiveKit unpublishes
-  // -- it can stop consuming a track without ever closing or erroring the
-  // stream on our end. What LiveKit's client library *does* do reliably,
-  // confirmed live, is log "unpublishing track" (via its own internal
-  // logger, livekit-client.esm.mjs) the moment the app tells it to stop
-  // sending a track -- that's a real, synchronous, third-party signal
-  // (not this app's own bundled/obfuscated code, so far less likely to
-  // silently change shape) that this round is genuinely over. Wrapping
-  // console.log to catch it and end our own track on cue turned out to be
-  // the only reliable way found to know the app's own "share" button
-  // ever becomes clickable again -- confirmed live that without this, it
-  // never re-enters the getDisplayMedia patch at all on a second share
-  // attempt (the app's own UI state depends on our track's 'ended' event
-  // the same way this patch's cleanup does).
-  const originalConsoleLog = console.log;
-  console.log = function (...args) {
-    if (args[0] === "unpublishing track" && realVideoTrack && realVideoTrack.readyState === "live") {
+  // The real, definitive signal that a round is over: overriding this
+  // track's own .stop(), not listening for its 'ended' event.
+  //
+  // Root cause (confirmed against livekit-client's actual source,
+  // github.com/livekit/client-sdk-js, src/room/track/Track.ts and
+  // LocalParticipant.ts): per the Media Capture and Streams spec,
+  // MediaStreamTrack.stop() does NOT dispatch 'ended' when the
+  // application itself calls it -- that event is reserved for
+  // spontaneous endings (e.g. a camera being unplugged), specifically so
+  // the caller isn't notified of something it already knows it did.
+  // LiveKit's own unpublish path (LocalParticipant.unpublishTrack ->
+  // LocalTrack.stop -> Track.stop -> mediaStreamTrack.stop()) is exactly
+  // this kind of app-initiated call, and runs by default
+  // (stopLocalTrackOnUnpublish defaults to true) every time the user
+  // clicks "stop sharing" -- meaning this track's 'ended' event was
+  // never going to fire for the one path that matters most, no matter
+  // how long this waited. That's the real explanation for every symptom
+  // chased in earlier sessions: the "ended"-only cleanup below simply
+  // never ran on a normal stop, silently leaking the Rust capture and
+  // leaving usingRustCapture/realVideoTrack pointed at a round LiveKit
+  // already considers gone -- which is exactly what made the *next*
+  // getDisplayMedia call fall into this file's reuse branch and hand
+  // back a track for a capture nobody was draining anymore, instead of
+  // negotiating fresh. (An earlier attempt patched around this by
+  // sniffing console.log for LiveKit's internal "unpublishing track"
+  // line and calling stop() on whatever realVideoTrack currently was --
+  // removed: that log line fires for the provisional round too, and by
+  // the time it's read, realVideoTrack may already have been reassigned
+  // to the newer round by getDisplayMedia's reuse branch, so it could
+  // kill a share that was still live. Overriding .stop() itself instead
+  // ties cleanup to the exact object being ended, with no such race.)
+  //
+  // liveRounds.add(videoTrack) is done *before* stopping any stale round
+  // below, not after: a stale round's own overridden .stop() (set up by
+  // a previous trackShareRound call) runs this same cleanup
+  // synchronously, and needs to see the new round already present to
+  // know a handoff -- not the whole share -- is what's happening.
+  function handleRoundEnded(videoTrack) {
+    console.log("[stoat-share-diag] handleRoundEnded", {
+      liveRoundsBefore: liveRounds.size,
+      alreadyHandled: !liveRounds.has(videoTrack),
+    });
+    if (!liveRounds.has(videoTrack)) return; // already handled
+    liveRounds.delete(videoTrack);
+    if (liveRounds.size > 0) return;
+    console.log("[stoat-share-diag] handleRoundEnded: last round, tearing down share");
+    // Belt-and-braces: whatever the app actually stopped (the original
+    // or a clone of it), make sure the real underlying capture is
+    // stopped too rather than assuming it already was. Re-entrant safe:
+    // realVideoTrack's own overridden .stop() (if it's a tracked round)
+    // re-invokes this function, but liveRounds.has() above is now false
+    // for it by then, so it returns immediately.
+    if (realVideoTrack) {
       realVideoTrack.stop();
+      realVideoTrack = null;
     }
-    return originalConsoleLog.apply(console, args);
-  };
+    if (activeCaptureHandleId != null) {
+      window.nativeScreenCapture.stop(activeCaptureHandleId);
+      activeCaptureHandleId = null;
+    }
+    usingRustCapture = false;
+    currentWriter = null;
+    stopActiveCapture();
+    window.native.screenShareEnded();
+  }
 
   function trackShareRound(stream) {
     const videoTrack = stream.getVideoTracks()[0];
     if (!videoTrack) return;
 
-    // The provisional round's track is never stopped by anyone: the web
-    // app just drops its reference once the confirmed round replaces
-    // it, and MediaStreamTrack.stop() is never automatic -- a track
-    // nobody calls .stop() on keeps its native capture (the actual
-    // screen-grab session, with all the GPU/shared-memory frame buffers
-    // backing it) running indefinitely, invisible to JS heap stats
-    // since none of that lives on the V8 heap. Left alone this
-    // compounds on every single share (each one abandons its own
-    // provisional round the same way), which is exactly what showed up
-    // as memory that kept climbing further with every share and never
-    // came back down. Explicitly stopping any round still marked live
-    // the moment a fresh one starts -- rather than waiting on an
-    // "ended" event that this specific track will never fire --closes
-    // that gap without depending on the web app's own cleanup.
-    for (const oldTrack of liveRounds) {
+    const staleTracks = [...liveRounds];
+    liveRounds.add(videoTrack);
+    for (const oldTrack of staleTracks) {
       if (oldTrack !== videoTrack) oldTrack.stop();
     }
-    liveRounds.clear();
 
-    liveRounds.add(videoTrack);
-    videoTrack.addEventListener(
-      "ended",
-      () => {
-        liveRounds.delete(videoTrack);
-        if (liveRounds.size > 0) return;
-        // Belt-and-braces: whatever the app actually stopped (the
-        // original or a clone of it), make sure the real underlying
-        // capture is stopped too rather than assuming it already was.
-        if (realVideoTrack) {
-          realVideoTrack.stop();
-          realVideoTrack = null;
-        }
-        if (activeCaptureHandleId != null) {
-          window.nativeScreenCapture.stop(activeCaptureHandleId);
-          activeCaptureHandleId = null;
-        }
-        usingRustCapture = false;
-        currentWriter = null;
-        stopActiveCapture();
-        window.native.screenShareEnded();
-      },
-      { once: true },
-    );
+    const nativeStop = videoTrack.stop.bind(videoTrack);
+    videoTrack.stop = function () {
+      console.log("[stoat-share-diag] track.stop() called", new Error().stack);
+      nativeStop();
+      handleRoundEnded(videoTrack);
+    };
+    // Still real for the Chromium-fallback path: the user can close the
+    // shared window/stop sharing via the OS itself, not through this
+    // app's UI at all -- nothing calls .stop() for that, so the native
+    // 'ended' event is the only signal for it. Harmless for the
+    // Rust-capture path, where nothing outside this patch's own control
+    // can end a round spontaneously.
+    videoTrack.addEventListener("ended", () => handleRoundEnded(videoTrack), { once: true });
   }
 
   // Builds a video track from world/screenShareCapture.ts's Rust-owned
@@ -530,6 +548,13 @@ function buildPatchScript(isWayland: boolean) {
   md.getDisplayMedia = async function (constraints) {
     let stream;
     let rustSourceType = null;
+
+    console.log("[stoat-share-diag] getDisplayMedia called", {
+      usingRustCapture,
+      hasRealVideoTrack: !!realVideoTrack,
+      realVideoTrackReadyState: realVideoTrack?.readyState,
+      msSinceCaptureStart: Date.now() - lastCaptureStartedAt,
+    });
 
     if (
       IS_WAYLAND &&

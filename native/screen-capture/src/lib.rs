@@ -235,12 +235,36 @@ pub fn start_capture(
     })
 }
 
+/// Shared, process-lifetime Tokio runtime -- deliberately NOT one fresh
+/// `Runtime::new()` per capture (that was the actual root cause of the
+/// "shares once, then hangs forever on the next share" bug, found this
+/// session): `ashpd`'s own `Proxy::connection()`
+/// (ashpd-0.13.13/src/proxy.rs) caches the D-Bus session connection in a
+/// process-wide `static SESSION: OnceLock<zbus::Connection>` -- created
+/// once, on whatever Tokio runtime happens to be active the *first* time
+/// any portal call is made, and reused (via the OnceLock, never
+/// recreated) by every later call regardless of which runtime asks for
+/// it. A fresh `Runtime::new()` per `run_capture()` call, dropped at the
+/// end of that same function, tears down that runtime's I/O driver and
+/// aborts every task spawned on it -- including zbus's own background
+/// task that actually reads/writes the connection's socket. The
+/// `zbus::Connection` *handle* itself survives (it's cached in ashpd's
+/// static, not owned by our dropped runtime), so it looks alive, but
+/// nothing is left running to ever complete a pending call on it. The
+/// second `negotiate_portal()` call -- from a brand new runtime -- reused
+/// that now-orphaned connection and hung forever on its very first
+/// await, confirmed live via per-stage `eprintln!`s in `negotiate_portal`
+/// (hung inside `Screencast::new()`, before even `create_session()`).
+/// One runtime for the whole process's lifetime keeps that connection's
+/// driver running for as long as anything might still use it.
+static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
 fn run_capture(
     stop_flag: Arc<AtomicBool>,
     on_ready: ThreadsafeFunction<Option<String>, ErrorStrategy::CalleeHandled>,
     on_frame: ThreadsafeFunction<FrameData, ErrorStrategy::CalleeHandled>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let rt = tokio::runtime::Runtime::new()?;
+    let rt = RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio runtime init"));
     let (fd, node_id, source_type) = rt.block_on(negotiate_portal())?;
     on_ready.call(
         Ok(source_type.map(str::to_string)),
@@ -248,6 +272,28 @@ fn run_capture(
     );
     capture_loop(fd, node_id, stop_flag, on_frame)
 }
+
+/// The portal's screencast permission token, saved from one negotiation and
+/// reused by the next. Process-lifetime only (an in-memory static, not
+/// persisted to disk) -- deliberately scoped to `PersistMode::Application`
+/// ("persist while the application is running"), not `ExplicitlyRevoked`
+/// ("persist until explicitly revoked" -- would survive app restarts,
+/// which is a real user-expectation/security surprise this app hasn't
+/// opted into). Exists because of a real, live-diagnosed bug: with
+/// `PersistMode::DoNot` (the previous, simpler setting), *every*
+/// negotiation -- including the second one in the same app session, e.g.
+/// stop-then-reshare -- opened a brand-new interactive portal picker
+/// dialog and blocked waiting for it. Confirmed live via
+/// `[stoat-capture-diag]` output: `start_capture()` was called for the
+/// second round, then nothing further (no on_ready, no on_error) for over
+/// 10s, matching LiveKit's own "waiting for pending publication promise
+/// timed out" on the JS side at almost exactly that delay -- consistent
+/// with a second picker dialog sitting unanswered (easy to miss: nothing
+/// in this app's own UI indicates a *system* dialog, not an app one,
+/// appeared). A restore token lets the portal skip that dialog entirely
+/// on any negotiation within the same run of this app, once the user has
+/// granted it once.
+static RESTORE_TOKEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 async fn negotiate_portal() -> std::result::Result<
     (std::os::fd::OwnedFd, u32, Option<&'static str>),
@@ -263,11 +309,15 @@ async fn negotiate_portal() -> std::result::Result<
     let proxy = Screencast::new().await?;
     let session = proxy.create_session(Default::default()).await?;
 
-    let select_options = SelectSourcesOptions::default()
+    let restore_token = RESTORE_TOKEN.lock().unwrap().clone();
+    let mut select_options = SelectSourcesOptions::default()
         .set_cursor_mode(CursorMode::Hidden)
         .set_sources(BitFlags::from(SourceType::Monitor) | SourceType::Window)
         .set_multiple(false)
-        .set_persist_mode(PersistMode::DoNot);
+        .set_persist_mode(PersistMode::Application);
+    if let Some(token) = &restore_token {
+        select_options = select_options.set_restore_token(token.as_str());
+    }
     proxy
         .select_sources(&session, select_options)
         .await?
@@ -277,6 +327,14 @@ async fn negotiate_portal() -> std::result::Result<
         .start(&session, None, StartCastOptions::default())
         .await?
         .response()?;
+
+    // Save whatever token the portal hands back for the *next*
+    // negotiation, whether or not one was sent this time -- confirmed
+    // against ashpd's own docs that the portal can rotate/reissue a new
+    // token on any successful start(), not just the very first one.
+    if let Some(token) = response.restore_token() {
+        *RESTORE_TOKEN.lock().unwrap() = Some(token.to_string());
+    }
 
     let stream = response
         .streams()
@@ -359,7 +417,24 @@ fn capture_loop(
     // was already only draining ~13-15fps per the simulcast stats noted
     // below, so 10fps costs little real quality and further shrinks how
     // much can pile up in that pipeline before it's actually sent.
-    const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100); // ~10fps
+    //
+    // Raised back to 60fps (2026-08-21, new session): that 13-15fps
+    // drain ceiling and ~950kbps achieved bitrate were both measured
+    // against the old Oracle VPS relay -- SPIKE.md's "migrated off the
+    // VPS entirely" session update since routed media over this user's
+    // home connection directly (real public IP, TURN enabled) instead of
+    // through a low-bandwidth VPS tier + WireGuard tunnel hop, which is
+    // exactly what that ceiling was attributed to. Untested at this rate
+    // since that migration -- this is the requested 1440p60fps target,
+    // not yet confirmed against real stats. The existing protections
+    // (this interval, the JS-side `desiredSize <= 0` backpressure check,
+    // mimalloc, the zero-init-skipping downscale) all still apply
+    // unchanged; if RSS or CPU grows unbounded again during a live test,
+    // the real `[stoat-stats]` console output (screenShareAudio.ts) will
+    // show whether it's still a drain-rate mismatch (qualityLimitationReason,
+    // achieved bitrate vs target) or something new -- check that before
+    // just lowering this number again.
+    const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16); // ~60fps
     // 1080p is the standard target for real-time video sharing -- well
     // past what's needed to read shared content clearly, at a fraction of
     // native monitor resolution's per-frame cost (2560x1440 -> 1920x1080
@@ -380,7 +455,28 @@ fn capture_loop(
     // encode pipeline buffers internally) by more than half versus 1920,
     // on top of the pixel-count-halves-both-simulcast-layers reasoning
     // already noted below.
-    const MAX_FRAME_DIMENSION: u32 = 1280;
+    //
+    // Tried 2560 (1440p, full native res on this monitor) (2026-08-21,
+    // new session) -- reverted. This is exactly the combination item 6
+    // above already lived through once: "full native monitor res at
+    // 60-80fps reliably froze the whole Electron app", fixed *then* by
+    // downscaling to 1920. Live-confirmed again this session: at 2560 +
+    // 60fps, the renderer's main thread became fully unresponsive within
+    // ~10-15s of a share starting -- not just slow, but unresponsive to
+    // CDP's own Runtime.evaluate (a 5s round-trip that should be near-
+    // instant), meaning the freeze is real main-thread saturation from
+    // the sustained per-frame work (a ~14.75MB copy every 16ms at this
+    // size, downscale_packed_4bpp is a no-op at exactly 2560, then a
+    // VideoFrame construction + write() on the page's main thread for
+    // every one of those), not a network-side limit -- the VPS
+    // migration fixed a *different* bottleneck (encode/send throughput)
+    // and never made this one better. 1920 was the highest value the
+    // prior session actually confirmed working at 60fps; back to that
+    // until this JS-side per-frame cost itself is reduced (a real buffer
+    // pool instead of a fresh Vec every frame, or capping delivery below
+    // 60fps at this resolution) -- raise this again only after such a
+    // change, not before.
+    const MAX_FRAME_DIMENSION: u32 = 1920;
     let last_frame_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
 
     let _listener = stream

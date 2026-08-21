@@ -1,5 +1,215 @@
 # Rust-owned screen capture -- spike notes
 
+## Session update (2026-08-21, third session): the REAL "share twice" bug
+## found and fixed -- a per-capture Tokio runtime orphaning ashpd's cached
+## D-Bus connection
+
+The `.stop()`-override fix from earlier this same day (still correct, see
+below) turned out to fix a *real* bug but not *the* bug: live-tested
+after it shipped, sharing still hung on the second attempt, silently --
+no picker dialog, nothing in the app, "share once then the button does
+nothing" exactly as originally reported. Root-caused this time by adding
+`eprintln!` at every `await` point inside `negotiate_portal()`
+(`Screencast::new`, `create_session`, `select_sources`, `start`,
+`open_pipe_wire_remote`) and reading a live capture: the second call
+hung on the very first line, `Screencast::new().await`, forever.
+
+**Root cause**: `run_capture()` created a **fresh `tokio::runtime::Runtime`
+per capture session** (`tokio::runtime::Runtime::new()?`, dropped at the
+end of that same function). `ashpd` (the portal client crate this addon
+uses) caches its D-Bus session connection **process-wide**, once, in a
+plain `static SESSION: OnceLock<zbus::Connection>`
+(`ashpd-0.13.13/src/proxy.rs:27`, confirmed by reading the vendored
+source directly under `~/.cargo/registry`) -- created on whichever Tokio
+runtime happens to be active the first time any portal call is made, and
+reused via that `OnceLock` by every later call, regardless of which
+runtime asks for it. Dropping the first capture's runtime tears down its
+I/O driver and aborts every task spawned on it, including zbus's own
+background task that actually pumps the connection's socket -- the
+`zbus::Connection` *handle* survives (it's owned by ashpd's static, not
+by the dropped runtime), so `Proxy::connection()` happily hands it back
+on the second call, but nothing is left running to ever complete a
+pending call on it. Second negotiation, second runtime, first `.await`:
+hangs forever, no error, no timeout, nothing -- exactly the "silent
+hang, no dialog, button just stops responding" symptom, for as many
+reshares as were attempted after the first.
+
+**Fix** (`src/lib.rs`): one `static RUNTIME: OnceLock<tokio::runtime::Runtime>`,
+created once and reused by every `run_capture()` call, replacing the
+per-call `Runtime::new()`. `Runtime::block_on` is safe to call from
+multiple threads against the same shared runtime (each capture still
+gets its own OS thread via `std::thread::spawn` in `start_capture`, they
+just now share one Tokio runtime instance instead of each getting -- and
+then killing -- their own).
+
+**Live-confirmed working**: three consecutive share -> stop -> share
+rounds in the same app session, all completing cleanly
+(`[stoat-capture-diag]` showing a full `Screencast::new -> create_session
+-> select_sources -> start -> open_pipe_wire_remote -> ... -> stop ->
+joined` cycle every time, no hangs). This is the actual fix for the
+long-standing "works once" bug -- the `.stop()`-override change earlier
+this session was real and worth keeping (it fixed a genuine, separate
+app-state-desync issue), but was not sufficient on its own.
+
+Also added this session, alongside the above (kept, working as intended):
+`PersistMode::Application` + an in-memory (process-lifetime,
+`static RESTORE_TOKEN: Mutex<Option<String>>`) portal restore token in
+`negotiate_portal()`, so only the *first* share of an app session shows
+the interactive picker dialog -- confirmed live: round 2 and round 3
+both reused the token from round 1 and skipped the dialog entirely, no
+picker shown, straight to capturing. Doesn't affect the runtime bug
+either way (it was masked by, not caused by, the missing dialog), but is
+a real, independent UX improvement worth keeping.
+
+**Live-measured resource cost** at the current 1920x1080@60fps setting,
+one active share, one remote participant: renderer RSS ~1GB, CPU ~100%
+(a full core) -- this is the "known real tension" flagged below made
+concrete: LiveKit's software VP8 simulcast encode (no VP8 hardware
+encode on this AMD GPU) is genuinely expensive at 60fps, independent of
+anything in this addon. Worth a real per-resolution/fps cost table
+before deciding a final target, not assumed further.
+
+Diagnostic `eprintln!`s added this session (`negotiate_portal`'s
+per-await tracing) removed once the bug they were added to find was
+confirmed fixed; the higher-level `[stoat-capture-diag]` lines
+(`start_capture`/`stop` lifecycle) stay, per this file's existing
+practice of keeping those.
+
+## Session update (2026-08-21, second session): "share twice" bug
+## root-caused (partially) and fixed; resolution/framerate raised back to
+## 1440p60fps
+
+### "Share only works once" -- root cause found, fix applied
+
+Root cause, confirmed against `livekit-client`'s actual source
+(`github.com/livekit/client-sdk-js`, `src/room/track/Track.ts` and
+`LocalParticipant.ts`, fetched and read this session -- the previous
+session's "not yet investigated" item): per the Media Capture and
+Streams spec, `MediaStreamTrack.stop()` does **not** dispatch `'ended'`
+when the application itself calls it -- that event exists specifically
+for *spontaneous* endings (e.g. a camera unplugged), so the caller isn't
+notified of something it already knows it did. LiveKit's own unpublish
+path (`LocalParticipant.unpublishTrack` -> `LocalTrack.stop()` ->
+`Track.stop()` -> `mediaStreamTrack.stop()`) is exactly this kind of
+app-initiated call, and runs by default (`stopLocalTrackOnUnpublish`
+defaults to `true`) every single time the user clicks "stop sharing".
+This app's own `state.tsx` also attaches
+`localTrack.on("ended", () => this.toggleScreenshare())` -- so the
+*app's* "am I sharing" flag depends on the exact same event this
+patch's cleanup was waiting for, and neither was ever going to fire on
+a normal stop.
+
+That fully explains every earlier session's symptoms: `trackShareRound`'s
+`'ended'`-only cleanup never actually ran on a real "stop sharing" click,
+silently leaking the Rust capture and leaving `usingRustCapture`/
+`realVideoTrack` pointed at a round LiveKit already considered gone --
+which is exactly what made the *next* `getDisplayMedia` call fall into
+this file's reuse branch and hand back a track for a capture nobody was
+draining anymore, instead of negotiating fresh. It also explains why the
+app's own share button silently did nothing on a second attempt: its
+`toggleScreenshare()` state was never getting flipped back either, for
+the identical reason.
+
+The previous session's workaround -- sniffing `console.log` for
+LiveKit's internal `"unpublishing track"` line and calling `.stop()` on
+whatever `realVideoTrack` currently was -- is now understood to have
+been actively unsafe on top of not fully fixing it: that log line fires
+for the provisional round's own unpublish too (not just a genuine user
+stop), and by the time it's read, `realVideoTrack` may already have been
+reassigned to a *newer* round by `getDisplayMedia`'s reuse branch --
+meaning it could kill a share that was still live, a believable
+explanation for "worked once, then failed again on retest."
+
+**Fix applied** (`src/world/screenShareAudio.ts`): removed the
+`console.log` sniffing entirely. `trackShareRound` now overrides the
+video track's own `.stop()` method (shadowing the native one as an own
+property on that specific instance) to run the round-ended cleanup
+synchronously, in addition to calling through to the real native stop.
+This ties cleanup to the exact call that ends a round -- whoever makes
+it (LiveKit's unpublish, this app, or this patch's own write-failure
+handling) -- with no event-timing dependency and no cross-round race:
+`liveRounds.add(videoTrack)` now happens *before* stopping any stale
+round, so a stale round's own overridden `.stop()` (which now runs
+cleanup synchronously) sees the new round already present and correctly
+treats it as a handoff, not the end of the whole share. The native
+`'ended'` listener is kept too, as a second path into the same
+(idempotent) cleanup function, for the Chromium-fallback path's one
+truly spontaneous case: the user closing the shared window via the OS
+itself rather than this app's UI.
+
+Not yet live-tested end to end (needs a real portal share/stop/reshare
+cycle) -- confirmed by reading the actual `livekit-client` source rather
+than guessing from symptoms this time, and the crate builds clean, but
+this should still be verified with a real multi-round share before
+trusting it the way earlier "fixed" attempts turned out not to be.
+
+### Resolution/framerate raised back toward 1440p60fps
+
+`MAX_FRAME_DIMENSION` (1280 -> 2560) and `MIN_FRAME_INTERVAL` (100ms/
+~10fps -> 16ms/~60fps) in `src/lib.rs` were both dropped chasing a
+500MB RAM budget in the *previous* session, reasoning that the real
+achievable throughput to this app's self-hosted LiveKit server was
+capped around 13-15fps / ~950kbps by the network path -- specifically,
+the Oracle VPS relay's low outbound bandwidth tier plus a WireGuard
+tunnel hop. That same session then migrated the whole stack off that
+VPS onto this user's home connection directly (real public IP, TURN
+enabled) -- if that ceiling really was the VPS/tunnel, it may no longer
+apply. Raised both back to the newly-requested 1440p60fps target on
+that basis; **not yet confirmed against real stats post-migration**.
+Both crate builds (debug and release) compile clean at these values.
+`downscale_packed_4bpp` is a no-op for any source at or below 2560px on
+its longer side, so a 1440p (or smaller) monitor now shares at native
+resolution; a 4K+ monitor still gets downscaled down to 1440p.
+
+**Live-tested, reverted**: 2560 (1440p) + 60fps froze the whole app
+within ~10-15s of a real share (confirmed via CDP -- `Runtime.evaluate`
+on the renderer didn't even respond within 5s, meaning the main thread
+was genuinely saturated, not just laggy). This is the *exact* freeze
+item 6 further down already documented once ("full native monitor res
+at 60-80fps reliably froze the whole app") and fixed by downscaling to
+1920 -- the VPS migration fixed a *different* bottleneck (encode/send
+throughput) and was never going to help this one, which is real
+main-thread cost per frame (a ~14.75MB copy every 16ms at 2560, a
+`VideoFrame` construction + `write()` on the page's main thread for
+each), unrelated to network. Reverted `MAX_FRAME_DIMENSION` back to
+1920 (see its own comment in `src/lib.rs`) -- the highest value a prior
+session actually confirmed working at 60fps. Kept `MIN_FRAME_INTERVAL`
+at 60fps for now since 1920x1080@60fps was that prior session's own
+confirmed-working combination, not an untested guess.
+
+To actually reach 1440p without refreezing, the JS-side per-frame cost
+itself needs to come down first -- candidates, not yet attempted: a
+real reusable buffer pool (noted as "deliberately not done" earlier in
+this file) instead of a fresh `Vec`/`VideoFrame` per frame, or capping
+delivery below 60fps specifically at higher resolutions (trade fps for
+resolution rather than assuming both are free once the network is
+fixed).
+
+Separately noticed and worth fixing regardless of resolution/fps
+(not yet done, flagging for later): `CaptureHandle::stop()` is a plain
+synchronous NAPI call that blocks the *calling* thread (the renderer's
+main JS thread, in every real caller) on `JoinHandle::join()`. Normally
+fast (~100ms, bounded by the capture thread's own stop-flag timer), but
+if the renderer's main thread is ever independently overloaded (as
+above), a call to `stop()` just becomes one more thing queued behind
+that overload rather than a way out of it -- worth making genuinely
+non-blocking (spawn the join on its own thread, or a real async NAPI
+task) as a hardening measure, so a slow/stuck teardown can never freeze
+the whole UI. Deferred this session to avoid stacking an untested
+concurrency change on top of an already-live-tested revert.
+
+Known real tension, still not measured: LiveKit's own simulcast encode
+(`encoderImplementation: "libvpx"` -- software, this AMD GPU's VA-API
+doesn't support VP8 hardware *encode*) does real CPU work that scales
+with pixel count, for *two* layers at once. Even at 1080p60fps this
+could be CPU-heavy -- "low CPU" and "60fps" may be in real tension on
+this hardware regardless of resolution. Next step: a live share/call at
+the current 1920x1080@60fps settings, then read the real `[stoat-stats]`
+console output (already wired up in `screenShareAudio.ts`) plus
+`ps`/`top` RSS and CPU% for the Electron renderer process during an
+active share, to see what's actually happening now rather than guessing
+further.
+
 ## Session update (2026-08-21, later): RAM/CPU fixed and verified; "share
 ## twice" bug still open
 
