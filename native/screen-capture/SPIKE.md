@@ -187,9 +187,43 @@ call happened to negotiate. Fixed in the modal's `callback` by calling the
 standard (not LiveKit-specific) `RTCRtpSender.setParameters()` -- get the
 current params, set `encodings[0].maxBitrate`/`maxFramerate` to the newly
 selected tier's `encoding`, `setParameters()` back -- right alongside the
-existing `applyConstraints()` call. Not yet re-validated live (deployed,
-not yet tested) -- do that before trusting it the way every other fix in
-this file was live-confirmed.
+existing `applyConstraints()` call.
+
+**Follow-up, same day**: live-testing this surfaced a second, real bug it
+introduced -- the modal's own `callback: async (qualityName, audio) => {
+callback(qualityName, audio); localTrack.resumeUpstream(); ... }` never
+awaited the inner `callback()` (fire-and-forget, pre-existing pattern, not
+introduced here), so `resumeUpstream()` (which calls `sender.replaceTrack()`)
+could run concurrently with the new `sender.setParameters()` call above --
+confirmed live: after this change, sharing looked like it started
+(resolution/qualityName correct in the modal) but real `getStats()` showed
+`framesSent` frozen at whatever count existed the instant of the race,
+never advancing again. Fixed by awaiting the inner callback before
+`resumeUpstream()` runs, and wrapping the `setParameters()` call itself in
+try/catch (since the caller now awaits it, an uncaught failure there would
+skip `resumeUpstream()` entirely -- worse than the original no-op).
+
+**Still unresolved after both fixes, not confirmed as a real bug**: fresh
+shares in this same testing session (screen_share_settings modal
+confirmed, no console errors from the new try/catch, Rust-side
+`dequeued`==`sent` confirming the local capture pipeline stayed
+healthy throughout) still showed one of the app's ~3 concurrent
+`RTCPeerConnection`s with `framesSent` frozen shortly after starting.
+This exact pattern (a second/provisional PC that stops advancing) recurred
+identically across every test this session regardless of what was
+changed, including on freshly-restarted, cache-cleared sessions -- most
+likely this app's own documented "provisional round" negotiation pattern
+(see earlier sessions in this file) rather than something introduced by
+today's fixes, but not conclusively isolated which PC is the real
+publisher without better tooling than `window.__stoatPCs` iteration
+provides. Real users in the same test session (2 remote participants)
+did confirm the share was visible and working, with good resolution and
+bitrate improving substantially once motion stopped -- consistent with
+the fixes above actually working end-to-end; the frozen-PC observation is
+most likely a diagnostic-tooling limitation, not a shipped regression, but
+flagged here for a future session to confirm with better instrumentation
+(e.g. tagging each PC by its actual role at creation time) before fully
+closing this out.
 
 ## Session update (2026-08-21, seventh session): AMD hardware H264/HEVC
 ## encode CONFIRMED working after fixing the missing VA-API driver -- the
