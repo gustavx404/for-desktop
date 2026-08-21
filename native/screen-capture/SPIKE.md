@@ -100,6 +100,68 @@ far).
 **Not yet done**: NVIDIA (CachyOS) and Intel (Pop!_OS) validation, planned
 since the seventh session.
 
+## Session update (2026-08-21, tenth session): the ACTUAL root cause of the
+## 2.5Mbps/15fps ceiling -- `videoEncoding` was silently a no-op for
+## screen-share tracks the whole time. Now fixed. fps/resolution both
+## climbing for real, matching the addon's own real throughput.
+
+The ninth session's "exactly 2,500,000, suspiciously round" observation
+was the real thread to pull. Read `computeVideoEncodings()` directly in
+`livekit-client`'s own source
+(`src/room/participant/publishUtils.ts`): for a screen-share track
+specifically, it reads `options.screenShareEncoding` -- **not**
+`options.videoEncoding`, which is what every earlier fix in this
+investigation (fifth session onward) had been setting. With
+`screenShareEncoding` unset and `simulcast: false`, `computeVideoEncodings`
+returns a bare `[{}]` -- no bitrate cap requested at all from this app's
+side -- meaning Chromium's own internal default (`2,500,000`, the exact
+constant every session kept measuring, across VP8, software H264, and
+hardware H264 alike) was what actually applied the entire time. Every
+per-tier `encoding` object built since the fifth session was correct and
+present, just written under the wrong key -- a genuine no-op, not a
+network or encoder limitation.
+
+**Fix**: renamed `videoEncoding` to `screenShareEncoding` in the
+`TrackPublishOptions` passed to `setScreenShareEnabled` (`state.tsx`).
+
+**Live-confirmed, immediately, dramatic result**: `qualityLimitationReason`
+switched from `"none"` (misleadingly implying no constraint) to
+`"bandwidth"` (a real, honest constraint report) for the first time this
+entire investigation -- WebRTC's own adaptation logic is now actually
+running against a real budget instead of silently sitting inside
+Chromium's comfortable 2.5Mbps default. Combined with the ninth session's
+`degradationPreference: "maintain-framerate"`, fps immediately jumped to
+~39-42fps (matching -- not exceeding -- the Rust addon's own real
+delivery rate, confirmed via `[stoat-frame-diag]`'s unchanged ~40fps
+received/written throughout), while resolution climbed progressively as
+available bitrate ramped: 640x360 -> 960x540 -> 1280x720 -> 1920x1080
+within about a minute of a single share, still rising when this session's
+observation window ended. This is the first time in the whole investigation
+(six-plus sessions) that fps has moved meaningfully past the ~15fps
+plateau on real motion content.
+
+**Net effect of sessions six through ten combined**: the original
+complaint ("fps e bitrate nao acompanha") is resolved via four independent,
+compounding fixes, each real and necessary on its own --
+1. `contentHint: "text"` -> `"motion"` (sixth session, small effect alone).
+2. The `rtc/index.ts` 640x480@5fps hard override, unrelated to any of this
+   investigation's own code, removed (eighth session) -- without this, no
+   later fix mattered, every tier was clobbered before it could apply.
+3. `AcceleratedVideoEncoder` enabled alongside the already-present
+   `VaapiVideoEncoder` (ninth session) -- real hardware H264 encode,
+   confirmed via `encoderImplementation`/`powerEfficientEncoder`, ~40% less
+   CPU than software VP8 at the same resolution.
+4. `screenShareEncoding` (not `videoEncoding`) plus
+   `degradationPreference: "maintain-framerate"` (tenth session) -- the
+   actual per-tier bitrate budget finally reaches the encoder, and fps is
+   prioritized the way `contentHint: "motion"` always implied it should be.
+
+**Not yet done**: let a share run long enough to see whether resolution
+settles at the full requested target (2560x1440 for "ultra") once
+bandwidth estimation fully converges, rather than stopping the observation
+mid-ramp; NVIDIA (CachyOS) and Intel (Pop!_OS) validation, still pending
+since the seventh session.
+
 ## Session update (2026-08-21, seventh session): AMD hardware H264/HEVC
 ## encode CONFIRMED working after fixing the missing VA-API driver -- the
 ## CPU bottleneck found in the sixth session has a real hardware fix on
