@@ -859,7 +859,7 @@ export function createMainWindow() {
   );
   ipcMain.on("close", () => mainWindow.close());
 
-  if (app.commandLine.hasSwitch("debug")) {
+  if (app.commandLine.hasSwitch("open-devtools")) {
     mainWindow.webContents.openDevTools();
   }
 
